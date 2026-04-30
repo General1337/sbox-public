@@ -565,8 +565,15 @@ internal sealed partial class PackageLoader : IDisposable
 		if ( HasOldReferencedAssemblyUnloaded( incoming?.Assembly, outgoing?.Assembly ) ) return false;
 
 		var sw = Stopwatch.StartNew();
+		var oldIlHotloadAssembly = outgoing?.ModifiedAssembly ?? outgoing?.Assembly;
 
-		if ( ILHotload.Replace( outgoing?.Assembly, outgoing?.ModifiedAssembly ?? outgoing?.Assembly, incoming?.Assembly ) == false )
+		if ( ILHotload.HasConsoleMetadataChanges( oldIlHotloadAssembly, incoming?.Assembly, out var consoleChanges ) )
+		{
+			log.Trace( $"Fast hotload vetoed: console metadata changed; falling back to full hotload.{Environment.NewLine}{string.Join( Environment.NewLine, consoleChanges.Select( x => $"  {x}" ) )}" );
+			return false;
+		}
+
+		if ( ILHotload.Replace( outgoing?.Assembly, oldIlHotloadAssembly, incoming?.Assembly ) == false )
 			return false;
 
 		sw.Stop();

@@ -6,6 +6,7 @@ using Sentry;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
@@ -95,7 +96,7 @@ public partial class ILHotload : IDisposable
 		{
 			if ( hasAttribute )
 			{
-				log.Warning( $"Fast hotload attempted, but members have changed.{Environment.NewLine}{string.Join( Environment.NewLine, unexpected.Select( x => $"  {x.ToSimpleString()}" ) )}" );
+				log.Warning( $"Fast hotload vetoed: member topology changed; falling back to full hotload.{Environment.NewLine}{string.Join( Environment.NewLine, unexpected.Select( x => $"  {x.ToSimpleString()}" ) )}" );
 			}
 
 			return false;
@@ -477,6 +478,118 @@ public partial class ILHotload : IDisposable
 
 		return true;
 	}
+
+	private const BindingFlags ConsoleMemberFlags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+	public static bool HasConsoleMetadataChanges( Assembly oldAsm, Assembly newAsm, out string[] changes )
+	{
+		var oldMetadata = GetConsoleMetadata( oldAsm );
+		var newMetadata = GetConsoleMetadata( newAsm );
+
+		var oldByKey = oldMetadata.ToDictionary( x => x.Key, StringComparer.Ordinal );
+		var newByKey = newMetadata.ToDictionary( x => x.Key, StringComparer.Ordinal );
+		var allKeys = oldByKey.Keys.Concat( newByKey.Keys ).Distinct( StringComparer.Ordinal ).OrderBy( x => x, StringComparer.Ordinal );
+		var result = new List<string>();
+
+		foreach ( var key in allKeys )
+		{
+			if ( !oldByKey.TryGetValue( key, out var oldMember ) )
+			{
+				result.Add( $"added {newByKey[key].Description}" );
+				continue;
+			}
+
+			if ( !newByKey.TryGetValue( key, out var newMember ) )
+			{
+				result.Add( $"removed {oldMember.Description}" );
+				continue;
+			}
+
+			if ( oldMember.Metadata != newMember.Metadata )
+			{
+				result.Add( $"changed {newMember.Description}" );
+			}
+		}
+
+		changes = result.ToArray();
+		return changes.Length > 0;
+	}
+
+	private static IEnumerable<ConsoleMetadataEntry> GetConsoleMetadata( Assembly assembly )
+	{
+		if ( assembly is null )
+			yield break;
+
+		foreach ( var type in assembly.GetTypes().OrderBy( x => x.FullName, StringComparer.Ordinal ) )
+		{
+			foreach ( var member in type.GetMembers( ConsoleMemberFlags ).OrderBy( x => x.Name, StringComparer.Ordinal ) )
+			{
+				var attribute = member.GetCustomAttribute<ConVarAttribute>();
+				if ( attribute is null )
+					continue;
+
+				if ( member is MethodInfo method )
+				{
+					if ( !method.IsStatic )
+						continue;
+
+					yield return CreateConsoleMetadata( member, attribute, GetMethodSignature( method ) );
+					continue;
+				}
+
+				if ( member is PropertyInfo property )
+				{
+					var get = property.GetGetMethod( true );
+					var set = property.GetSetMethod( true );
+
+					if ( get is null || set is null || !get.IsStatic )
+						continue;
+
+					yield return CreateConsoleMetadata( member, attribute, $"{property.PropertyType.FullName} {property.Name}" );
+				}
+			}
+		}
+	}
+
+	private static ConsoleMetadataEntry CreateConsoleMetadata( MemberInfo member, ConVarAttribute attribute, string signature )
+	{
+		var declaringType = member.DeclaringType?.FullName ?? string.Empty;
+		var name = string.IsNullOrWhiteSpace( attribute.Name ) ? member.Name : attribute.Name;
+		var minValue = GetNullableFloatField( attribute, "MinValue" );
+		var maxValue = GetNullableFloatField( attribute, "MaxValue" );
+		var defaultValue = member.GetCustomAttribute<DefaultValueAttribute>()?.Value?.ToString() ?? string.Empty;
+
+		var metadata = string.Join( "|",
+			attribute.GetType().FullName,
+			name,
+			attribute.Help ?? string.Empty,
+			attribute.Flags,
+			minValue?.ToString( "R", System.Globalization.CultureInfo.InvariantCulture ) ?? string.Empty,
+			maxValue?.ToString( "R", System.Globalization.CultureInfo.InvariantCulture ) ?? string.Empty,
+			defaultValue );
+
+		var key = $"{declaringType}|{member.MemberType}|{member.Name}|{signature}";
+		var description = $"{attribute.GetType().Name} {name} on {declaringType}.{member.Name}";
+
+		return new ConsoleMetadataEntry( key, metadata, description );
+	}
+
+	private static float? GetNullableFloatField( ConVarAttribute attribute, string fieldName )
+	{
+		return (float?)typeof( ConVarAttribute )
+			.GetField( fieldName, BindingFlags.Instance | BindingFlags.NonPublic )
+			?.GetValue( attribute );
+	}
+
+	private static string GetMethodSignature( MethodInfo method )
+	{
+		var parameters = method.GetParameters()
+			.Select( x => $"{x.ParameterType.FullName} {x.Name}" );
+
+		return $"{method.ReturnType.FullName} {method.Name}({string.Join( ",", parameters )})";
+	}
+
+	private readonly record struct ConsoleMetadataEntry( string Key, string Metadata, string Description );
 
 	private static void ReplaceMonoModReflectionCache( Assembly asm )
 	{

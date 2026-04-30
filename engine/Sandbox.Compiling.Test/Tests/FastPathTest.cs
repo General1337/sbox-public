@@ -146,6 +146,41 @@ public partial class FastPathTest
 		Assert.AreEqual( 0, TestProgram( program, "Hello Blorld!" ) );
 	}
 
+	[TestMethod]
+	public async Task ConsoleMetadataChange()
+	{
+		using var compiler = new FastPathTestCompiler( "ConsoleMetadata.cs" );
+
+		var result = await compiler.BuildAsync( version: 1 );
+		var oldAssembly = result.MethodBodyAssembly;
+
+		result = await compiler.BuildAsync( version: 2 );
+
+		Assert.IsTrue( result.ILHotloadSupported );
+		Assert.IsTrue( ILHotload.HasConsoleMetadataChanges( oldAssembly, result.MethodBodyAssembly, out var changes ) );
+		Assert.IsTrue( changes.Any( x => x.Contains( "test.fastpath" ) ) );
+		Assert.IsTrue( changes.Any( x => x.Contains( "test.fastvar" ) ) );
+	}
+
+	[TestMethod]
+	public async Task ConsoleMetadataUnchanged()
+	{
+		using var compiler = new FastPathTestCompiler( "ConsoleMetadata.cs" );
+
+		var result = await compiler.BuildAsync( version: 1 );
+		var oldAssembly = result.MethodBodyAssembly;
+		var program = result.CreateProgram();
+
+		Assert.AreEqual( 0, TestProgram( program, "one" ) );
+
+		result = await compiler.BuildAsync( version: 3 );
+
+		Assert.IsTrue( result.ILHotloadSupported );
+		Assert.IsFalse( ILHotload.HasConsoleMetadataChanges( oldAssembly, result.MethodBodyAssembly, out var changes ) );
+		Assert.AreEqual( 0, changes.Length );
+		Assert.AreEqual( 0, TestProgram( program, "two" ) );
+	}
+
 	/// <summary>
 	/// Tests multiple methods having the same name, but only one changes.
 	/// </summary>
