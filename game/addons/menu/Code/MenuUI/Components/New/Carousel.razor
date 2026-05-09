@@ -26,9 +26,9 @@
 
     [Parameter] public Action<object> OnItemChanged { get; set; }
 
-    private Panel ContentParent;
-    private Panel ScrollLeft;
-    private Panel ScrollRight;
+    private Panel ContentParent { get; set; }
+    private Panel ScrollLeft { get; set; }
+    private Panel ScrollRight { get; set; }
 
     private int ActiveIndex = 0;
 

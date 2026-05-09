@@ -2,7 +2,16 @@ ServerList
 {
 	flex-direction: column;
 	overflow: scroll;
-	padding-top: 16px;
+
+	VirtualList
+	{
+		flex-grow: 1;
+
+		.row
+		{			
+			flex-grow: 1;
+		}
+	}
 }
 
 .notice
@@ -15,8 +24,8 @@ ServerList
 .loading
 {
 	justify-content: center;
-	padding: 50px;
-	font-size: 1rem;
+	align-items: center;
+	height: 100%;
 }
 
 h2
@@ -48,7 +57,6 @@ h2
 .row
 {
 	flex-shrink: 0;
-	flex-grow: 1;
 	border-radius: 2px;
 	padding: 0px 48px;
 	cursor: pointer;
@@ -63,18 +71,43 @@ h2
 
 	.game, .map
 	{
-		width: 25%;
+		width: 30%;
 	}
 
 	.title
 	{
-		width: 67%;
+		flex-grow: 1;
 	}
 
 	.members
 	{
-		flex-grow: 1;
+		width: 100px;
+		flex-shrink: 0;
 		justify-content: flex-end;
+	}
+
+	.ping-icon
+	{
+		width: 24px;
+		flex-shrink: 0;
+		margin-left: 16px;
+		justify-content: center;
+		align-items: center;
+
+		&.good { color: #4ade80; }
+		&.okay { color: #facc15; }
+		&.bad { color: #f87171; }
+	}
+
+	.ping-value
+	{
+		width: 56px;
+		flex-shrink: 0;
+
+		&.good { color: #4ade80; }
+		&.okay { color: #facc15; }
+		&.bad { color: #f87171; }
+		&.unknown { opacity: 0.3; }
 	}
 
 	&:not(.header)
@@ -141,12 +174,8 @@ h2
 
 	&.header
 	{
-		.members
-		{
-			justify-content: center;
-		}
-
 		background-color: #101219dd;
 		padding: 8px 48px;
+		flex-grow: 0;
 	}
 }

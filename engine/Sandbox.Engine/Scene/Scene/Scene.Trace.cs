@@ -16,7 +16,8 @@ public partial class Scene : GameObject
 
 		if ( trace.NeedsFilterCallback )
 		{
-			trace.PhysicsTrace.filterCallback = trace.FilterCallback;
+			SceneTrace.SetTraceFilter( in trace );
+			trace.PhysicsTrace.filterCallback = SceneTrace.PhysicsFilterCallback;
 		}
 
 		if ( trace.IncludePhysicsWorld )
@@ -33,7 +34,7 @@ public partial class Scene : GameObject
 		if ( trace.IncludeRenderMeshes && SceneWorld is not null )
 		{
 			var mt = Engine.Utility.RayTrace.MeshTraceRequest.From( trace.PhysicsTrace.request, SceneWorld, trace.CullMode );
-			mt.filterCallback = trace.NeedsFilterCallback ? trace.FilterCallback : default;
+			mt.filterCallback = trace.NeedsFilterCallback ? SceneTrace.MeshFilterCallback : default;
 			var meshTraceResults = mt.RunAll();
 
 			foreach ( var meshTraceResult in meshTraceResults )
@@ -53,6 +54,7 @@ public partial class Scene : GameObject
 			}
 		}
 
+		SceneTrace.ClearTraceFilter();
 		return results.OrderBy( r => r.Fraction );
 	}
 
@@ -66,7 +68,8 @@ public partial class Scene : GameObject
 
 		if ( trace.NeedsFilterCallback )
 		{
-			trace.PhysicsTrace.filterCallback = trace.FilterCallback;
+			SceneTrace.SetTraceFilter( in trace );
+			trace.PhysicsTrace.filterCallback = SceneTrace.PhysicsFilterCallback;
 		}
 
 		if ( trace.IncludePhysicsWorld )
@@ -78,7 +81,7 @@ public partial class Scene : GameObject
 		if ( trace.IncludeRenderMeshes && SceneWorld is not null )
 		{
 			var mt = Engine.Utility.RayTrace.MeshTraceRequest.From( trace.PhysicsTrace.request, SceneWorld, trace.CullMode );
-			mt.filterCallback = trace.NeedsFilterCallback ? trace.FilterCallback : default;
+			mt.filterCallback = trace.NeedsFilterCallback ? SceneTrace.MeshFilterCallback : default;
 			var meshTraceResult = mt.Run();
 			if ( meshTraceResult.Hit )
 			{
@@ -99,6 +102,8 @@ public partial class Scene : GameObject
 					bestResult = result.Value;
 			}
 		}
+
+		SceneTrace.ClearTraceFilter();
 
 		if ( bestResult.Fraction < 2 )
 			return bestResult;
@@ -665,11 +670,31 @@ public partial struct SceneTrace
 		return scene.RunTraceAll( this );
 	}
 
+	// Cached delegates and per-trace filter state to avoid boxing SceneTrace struct
+	internal static readonly Func<PhysicsShape, bool> PhysicsFilterCallback = FilterCallbackPhysicsShape;
+	internal static readonly Func<SceneObject, bool> MeshFilterCallback = FilterCallbackSceneObject;
+
+	[ThreadStatic] static ImmutableArray<GameObject> _traceIgnoreSingle;
+	[ThreadStatic] static ImmutableArray<GameObject> _traceIgnoreHierarchy;
+
+	internal static void SetTraceFilter( in SceneTrace trace )
+	{
+		_traceIgnoreSingle = trace.IgnoreSingleObject;
+		_traceIgnoreHierarchy = trace.IgnoreHierarchy;
+	}
+
+	internal static void ClearTraceFilter()
+	{
+		_traceIgnoreSingle = default;
+		_traceIgnoreHierarchy = default;
+	}
+
+
 	/// <summary>
 	/// Return true if we should hit this shape.
 	/// We purposely keep this locked down, don't offer a user specified callback.
 	/// </summary>
-	internal readonly bool FilterCallback( PhysicsShape shape )
+	static bool FilterCallbackPhysicsShape( PhysicsShape shape )
 	{
 		var colliderObject = shape.Collider?.GameObject;
 		var bodyObject = shape.Body?.GameObject;
@@ -678,46 +703,46 @@ public partial struct SceneTrace
 		// Check both collider and body GameObjects.
 		// The user might ignore either one.
 		//
-		if ( colliderObject != null && IgnoreSingleObject.Contains( colliderObject ) )
+		if ( colliderObject != null && _traceIgnoreSingle.Contains( colliderObject ) )
 			return false;
 
-		if ( bodyObject != null && bodyObject != colliderObject && IgnoreSingleObject.Contains( bodyObject ) )
+		if ( bodyObject != null && bodyObject != colliderObject && _traceIgnoreSingle.Contains( bodyObject ) )
 			return false;
 
 		//
 		// Prefer the collider GameObject.
 		// Fall back to body if needed.
 		//
-		return FilterCallback( colliderObject ?? bodyObject );
+		return FilterCallbackGameObject( colliderObject ?? bodyObject );
 	}
 
 	/// <summary>
 	/// Return true if we should hit this sceneobject.
 	/// We purposely keep this locked down, don't offer a user specified callback.
 	/// </summary>
-	internal readonly bool FilterCallback( SceneObject so )
+	static bool FilterCallbackSceneObject( SceneObject so )
 	{
 		var go = so.GameObject;
 
 		//
 		// Ignore this object directly
 		//
-		if ( IgnoreSingleObject.Contains( go ) )
+		if ( _traceIgnoreSingle.Contains( go ) )
 			return false;
 
-		return FilterCallback( go );
+		return FilterCallbackGameObject( go );
 	}
 
-	readonly bool FilterCallback( GameObject go )
+	static bool FilterCallbackGameObject( GameObject go )
 	{
 		if ( go is null ) return true;
 
 		//
 		// Ignore anything under a hierarchy we're skipping
 		//
-		for ( int i = 0; i < IgnoreHierarchy.Length; i++ )
+		for ( int i = 0; i < _traceIgnoreHierarchy.Length; i++ )
 		{
-			if ( go.IsAncestor( IgnoreHierarchy[i] ) )
+			if ( go.IsAncestor( _traceIgnoreHierarchy[i] ) )
 				return false;
 		}
 

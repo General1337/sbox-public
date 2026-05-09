@@ -56,44 +56,9 @@ CreateGameModal .tabs
     }
 }
 
-CreateGameModal .header
+CreateGameModal PackageHero.header
 {
     flex-shrink: 0;
-    padding: 326px;
-    font-size: 15px;
-    font-weight: 550;
-    background-color: #161922;
-    padding: 8px 16px;
-    color: rgba(178, 190, 212, 0.8);
-    align-items: center;
-    gap: 1rem;
-
-	.icon
-	{
-		height: 50px;
-		aspect-ratio: 1 / 1;
-		background-size: cover;
-		background-position: center;
-		border-radius: 4px;
-		box-shadow: 2px 2px 20px #0002;
-		border: 1px solid #ffffff04;
-	}
-
-    .title
-    {
-        align-items: center;
-        gap: 0.5rem;
-
-		>.main
-		{
-			color: $default-text;
-		}
-
-        i
-        {
-            opacity: 0.2;
-        }
-    }
 }
 
 CreateGameModal .dropdown

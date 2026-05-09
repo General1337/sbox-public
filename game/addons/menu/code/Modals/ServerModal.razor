@@ -2,6 +2,7 @@
 @inherits MenuProject.Modals.BaseModal
 @using Sandbox;
 @using Sandbox.Network;
+@using Sandbox.UI
 
 <root>
 	<div class="window">
@@ -57,7 +58,7 @@
 		</div>
 
 		<div class="footer">
-			<Button class="clicky" onclick=@(() => CloseModal( false ))>Cancel</Button>
+			<Button class="clicky" @onclick=@(() => CloseModal( false ))>Cancel</Button>
 			<Button class="clicky primary" Disabled=@(!MenuHelpers.HasAuthority) Icon="play_circle_filled" onclick=@JoinServer>Join Server</Button>
 		</div>
 
@@ -120,7 +121,7 @@
 	void OpenMapInfo()
 	{
 		if ( MapPackage is null ) return;
-		Game.Overlay.ShowPackageModal( MapPackage.FullIdent );
+		Game.Overlay.ShowMapModal( MapPackage.FullIdent );
 	}
 
 	protected override int BuildHash() => System.HashCode.Combine( Server.LobbyId, GamePackage?.Thumb, MapPackage?.Thumb, MenuHelpers.HasAuthority );

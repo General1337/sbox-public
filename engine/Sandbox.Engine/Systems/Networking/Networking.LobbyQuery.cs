@@ -82,6 +82,7 @@ public static partial class Networking
 					Map = e.Map,
 					Members = e.Players,
 					MaxMembers = e.MaxPlayers,
+					Ping = e.Ping,
 					Data = new()
 				};
 
@@ -178,13 +179,13 @@ public static partial class Networking
 		// by key name
 		q = q.WithMaxResults( 1000 );
 
-		var lobbies = await q.RequestAsync( ct );
+		var lobbies = await q.RequestAsync( ct ).ConfigureAwait( false );
 
 		var found = new List<LobbyInformation>();
 
 		try
 		{
-			var servers = await serverListTask;
+			var servers = await serverListTask.ConfigureAwait( false );
 			if ( servers is not null && servers.Any() )
 			{
 				found.AddRange( servers );
@@ -203,6 +204,7 @@ public static partial class Networking
 			var item = new LobbyInformation();
 			item.LobbyId = l.Id;
 			item.OwnerId = l.Owner.Id;
+			item.Ping = -1;
 
 			item.MaxMembers = l.MaxMembers;
 			item.Members = l.MemberCount;

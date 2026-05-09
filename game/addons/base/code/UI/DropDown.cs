@@ -108,6 +108,7 @@ namespace Sandbox.UI
 		{
 			AddClass( "dropdown" );
 			DropdownIndicator = Add.Icon( "expand_more", "dropdown_indicator" );
+			AcceptsFocus = true;
 		}
 
 		public DropDown( Panel parent ) : this()
@@ -115,9 +116,13 @@ namespace Sandbox.UI
 			Parent = parent;
 		}
 
-		public override void SetPropertyObject( string name, object value )
+		protected override void OnEscape( PanelEvent e )
 		{
-			base.SetPropertyObject( name, value );
+			if ( Popup != null )
+			{
+				Popup.Delete();
+				e.StopPropagation();
+			}
 		}
 
 		/// <summary>

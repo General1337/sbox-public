@@ -12,10 +12,14 @@
 
 @code 
 {
-    public Package MapPackage;
-    public Package GamePackage;
+    [Parameter]
+    public Package MapPackage { get; set; }
 
-    public Action<Package> OnValueChanged;
+    [Parameter]
+    public Package GamePackage { get; set; }
+
+    [Parameter]
+    public Action<Package> OnValueChanged { get; set; }
 
 
     protected override void OnMouseUp(MousePanelEvent e)

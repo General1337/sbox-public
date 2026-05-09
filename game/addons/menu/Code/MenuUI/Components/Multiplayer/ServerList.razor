@@ -1,11 +1,14 @@
 ﻿@using Sandbox.Modals
 @using Sandbox
 @using Sandbox.Network
+@using Sandbox.UI
 
 <root>
     @if ( busy )
     {
-        <div class="loading"><i>settings_ethernet</i></div>
+        <div class="loading">
+            <Spinner/>
+        </div>
     }
     else if ( viewMode == ViewMode.GameGroup )
     {
@@ -36,7 +39,12 @@
                           TotalPlayers="@scopedGroup.TotalPlayers"
                           ServerCount="@scopedGroup.ServerCount"
                           OnGroupClick=@BackToGames>
-                <Left><i>arrow_back</i></Left>
+                            <Left>
+            @if (string.IsNullOrWhiteSpace(Config.GamePackageFilter))
+            {
+                <i>arrow_back</i>
+            }
+            </Left>
             </GameGroupRow>
         }
 
@@ -50,6 +58,8 @@
                 <h2 class="title" onclick="@(() => SetSort( "name" ))">Name</h2>
                 <h2 class="map" onclick="@(() => SetSort( "map" ))">Map</h2>
                 <h2 class="members" onclick="@(() => SetSort( "members" ))">Players</h2>
+                <h2 class="ping-icon" />
+                <h2 class="ping-value" onclick="@(() => SetSort("ping"))">Ping</h2>
             </div>
             <VirtualList Items=@GetServerData() ItemHeight=@(48)>
                 <Item Context="item">
@@ -122,6 +132,7 @@
             "name" => x => x.Name,
             "map" => x => x.Map,
             "members" => x => x.Members,
+            "ping" => x => x.Ping,
             _ => x => x.Members
         };
 
@@ -153,6 +164,9 @@
 
     void BackToGames()
     {
+        if (!string.IsNullOrEmpty(Config.GamePackageFilter) )
+            return; // single-game enforced
+
         scopedGame = null;
         scopedGroup = null;
         viewMode = ViewMode.GameGroup;
@@ -188,6 +202,12 @@
         lobbies = await Networking.QueryLobbies( filters );
 
         busy = false;
+
+        if (viewMode == ViewMode.ServerList && !string.IsNullOrWhiteSpace(Config.GamePackageFilter))
+        {
+            scopedGame = Config.GamePackageFilter;
+            scopedGroup = new GameGroup( Config.GamePackageFilter, lobbies.Sum(x => x.Members), lobbies.Count );
+        }
 
         StateHasChanged();
     }

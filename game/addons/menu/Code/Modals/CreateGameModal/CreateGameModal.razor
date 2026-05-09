@@ -10,12 +10,13 @@
 
 <root>
     <div class="window">
-        <div class="header">
-			<div class="icon" style="background-image: url( @Package.Thumb );"></div>
-            <div class="title">
-                <label>@Package.Title</label><i>arrow_forward_ios</i><label class="main medium">Create Game</label>
-            </div>
-        </div>
+        <PackageHero Package="@Package" class="header">
+            <Actions>
+                <column class="header-title">
+                    <label class="medium">Create Game</label>
+                </column>
+            </Actions>
+        </PackageHero>
 
         <div class="body">
             <div class="tabs">
@@ -76,7 +77,7 @@
 						<div class="row">
                             <div class="is-label">Map</div>
                             <div class="control">
-                                <MapSelector MapPackage=@MapPackage OnValueChanged =@OnMapSelected />
+                                <MapSelector MapPackage=@MapPackage OnValueChanged=@OnMapSelected />
                             </div>
                         </div>
                     }
