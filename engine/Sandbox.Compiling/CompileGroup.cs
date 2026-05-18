@@ -14,6 +14,78 @@ public class CompileGroup : IDisposable
 	/// </summary>
 	public static bool SuppressBuildNotifications { get; set; } = true;
 
+	// ── engine-fork-elite-leverage Phase 1.1 (AP-100 cure) ────────────────
+	// Sandbox++ engine-fork patch (NOT in Facepunch/sbox-public master).
+	// Adds a global observability event so MCP plugins / IDE tooling can
+	// subscribe to every CompileGroup.BuildAsync completion without owning
+	// a per-instance CompileGroup reference. Companion library subscriber
+	// lives at Libraries/arenula_mcp/Editor/Handlers/CompileHandler.cs
+	// behind #if FORK_ENGINE. Detection marker for the library's msbuild
+	// Exists() probe is written by the static initializer below.
+	// Ref: docs/ai/initiatives/engine-fork-elite-leverage/charter.md §"Phase 1 patch table" 1.1
+	// Ref: docs/ai/sessions/2026-05-18-engine-fork-phase1-1-compiler-on-build-completed/phase-01-design.md
+
+	/// <summary>
+	/// Fired once per <see cref="BuildAsync"/> completion (success or failure).
+	/// Payload is the aggregated <see cref="CompilerOutput"/> array from this group's
+	/// BuildAsync run — same data reachable via <see cref="BuildResult"/>.Output, but
+	/// delivered as a static event so observability tooling (MCP plugins, IDE
+	/// extensions) can subscribe globally without owning a CompileGroup reference.
+	///
+	/// Fires AFTER <see cref="BuildResult"/> is published and BEFORE the per-instance
+	/// <see cref="OnCompileFinished"/> Action runs. Handlers MUST NOT throw —
+	/// exceptions are caught and logged. Handlers run synchronously on the build's
+	/// continuation thread; marshal heavy work to your own thread.
+	///
+	/// Multi-subscriber safe (standard C# event semantics). On hotload, the engine
+	/// assembly persists (this class carries [SkipHotload]), so old library
+	/// subscribers remain attached unless the library explicitly -= unsubscribes
+	/// in its hotload handler. The library is expected to use a -+=  re-bind
+	/// pattern across hotloads.
+	/// </summary>
+	public static event Action<CompilerOutput[]> OnBuildCompleted;
+
+	internal static void RaiseOnBuildCompleted( CompilerOutput[] outputs )
+	{
+		var handler = OnBuildCompleted;
+		if ( handler == null ) return;
+
+		// Per-subscriber try/catch so one bad handler can't break the chain.
+		foreach ( var subscriber in handler.GetInvocationList() )
+		{
+			try { ((Action<CompilerOutput[]>)subscriber).Invoke( outputs ); }
+			catch ( System.Exception e )
+			{
+				Log.Warning( $"CompileGroup.OnBuildCompleted handler threw: {e.Message}" );
+			}
+		}
+	}
+
+	// Writes a marker file alongside Sandbox.Compiling.dll so the Sandbox++
+	// MCP library's msbuild can detect the fork at compile time via Exists().
+	// Marker content carries a schema version so future fork-engine bumps
+	// can be detected without breaking older library builds.
+	static CompileGroup()
+	{
+		try
+		{
+			var asmPath = typeof( CompileGroup ).Assembly.Location;
+			if ( string.IsNullOrEmpty( asmPath ) ) return;
+
+			var managedDir = System.IO.Path.GetDirectoryName( asmPath );
+			if ( string.IsNullOrEmpty( managedDir ) ) return;
+
+			var markerPath = System.IO.Path.Combine( managedDir, ".fork_marker" );
+			if ( System.IO.File.Exists( markerPath ) ) return;
+
+			System.IO.File.WriteAllText( markerPath, "engine-fork-elite-leverage:1\n" );
+		}
+		catch
+		{
+			// Marker is advisory — never fail engine load over diagnostics.
+		}
+	}
+
 	/// <summary>
 	/// The compilers within the group
 	/// </summary>
@@ -324,6 +396,11 @@ public class CompileGroup : IDisposable
 			}
 
 			BuildResult = result;
+
+			// engine-fork-elite-leverage Phase 1.1 — raise the static observability
+			// event BEFORE the per-instance OnCompileFinished so subscribers see a
+			// consistent state (BuildResult populated, IsBuilding still true).
+			RaiseOnBuildCompleted( result.Output?.ToArray() ?? System.Array.Empty<CompilerOutput>() );
 
 			OnCompileFinished.InvokeWithWarning();
 
