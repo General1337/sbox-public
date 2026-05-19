@@ -111,6 +111,20 @@ public partial class TypeLibrary
 		}
 
 		PostAddCallbacks = null;
+
+		// [HANDOFF-TRUST: additive observation event per user-aligned phase-01-design.md; no inherited-hypothesis dependency.]
+		// Snapshot the TypeDescriptions just added from THIS AddAssembly call
+		// (typedata.Values includes prior assemblies — we only want this batch).
+		// Captured after Parallel.ForEach join so typedata lookups are safe.
+		var registeredTypes = types
+			.Select( t => typedata.GetValueOrDefault( t ) )
+			.Where( td => td is not null )
+			.ToArray();
+
+		// Fire observation event for fork-only MCP tooling subscribers.
+		// See TypeLibrary.OnRegistered.cs for contract.
+		RaiseOnAssemblyRegistered( incoming, registeredTypes );
+
 		InitBytePack();
 	}
 

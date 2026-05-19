@@ -29,8 +29,11 @@ internal static partial class ConVarSystem
 	/// </summary>
 	internal static void AddAssembly( Assembly assembly, string cookies, string context = null )
 	{
+		// [HANDOFF-TRUST: additive observation event per user-aligned phase-01-design.md; no inherited-hypothesis dependency.]
 		if ( assembly == null )
 			return;
+
+		var justAdded = new List<Command>();
 
 		foreach ( var t in assembly.GetTypes() )
 		{
@@ -54,7 +57,9 @@ internal static partial class ConVarSystem
 						if ( !get.IsStatic )
 							continue;
 
-						AddConVar( new ManagedCommand( assembly, member, attribute, GetCookies( cookies ) ) );
+						var cmd = new ManagedCommand( assembly, member, attribute, GetCookies( cookies ) );
+						AddConVar( cmd );
+						justAdded.Add( cmd );
 					}
 
 					if ( member is MethodInfo method )
@@ -62,7 +67,9 @@ internal static partial class ConVarSystem
 						if ( !method.IsStatic )
 							continue;
 
-						AddCommand( new ManagedCommand( assembly, member, attribute, GetCookies( cookies ) ) );
+						var cmd = new ManagedCommand( assembly, member, attribute, GetCookies( cookies ) );
+						AddCommand( cmd );
+						justAdded.Add( cmd );
 					}
 				}
 				catch ( Exception e )
@@ -71,6 +78,10 @@ internal static partial class ConVarSystem
 				}
 			}
 		}
+
+		// Fire observation event for fork-only MCP tooling subscribers.
+		// See ConVarSystem.OnRegistered.cs for contract.
+		RaiseOnAssemblyRegistered( assembly, justAdded.ToArray() );
 	}
 
 	/// <summary>
