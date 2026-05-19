@@ -173,6 +173,8 @@ static class AssetThumbnail
 		catch ( System.Exception e )
 		{
 			Log.Warning( e, $"Exception when compiling thumbnail for {asset.Path}" );
+			// [HANDOFF-TRUST: feature-build additive raise-call insertion, Phase 2.4 / 1.6 fork-event emit site; mirrors Scene.OnMutation.cs pattern; independent of any ranked hypothesis from inherited handoffs]
+			AssetSystem.RaiseOnAssetCompileFailed( asset, $"Thumbnail compile failed: {asset.Path}", e );
 		}
 		finally
 		{

@@ -310,6 +310,8 @@ internal class NativeAsset : Asset
 			return false;
 
 		Log.Warning( $"Not Compiled: {this} ({native.GetCompileStateReason_Transient()})" );
+		// [HANDOFF-TRUST: feature-build additive raise-call insertion, Phase 2.4 / 1.6 fork-event emit site; mirrors Scene.OnMutation.cs pattern; independent of any ranked hypothesis from inherited handoffs]
+		AssetSystem.RaiseOnAssetCompileFailed( this, $"Not compiled: {Path} ({native.GetCompileStateReason_Transient()})", null );
 
 		// This is completely synchronous right now
 		Compile( true );
@@ -326,12 +328,16 @@ internal class NativeAsset : Asset
 			if ( IsCompileFailed )
 			{
 				Log.Warning( $"Error compiling {this}" );
+				// [HANDOFF-TRUST: feature-build additive raise-call insertion, Phase 2.4 / 1.6 fork-event emit site; mirrors Scene.OnMutation.cs pattern; independent of any ranked hypothesis from inherited handoffs]
+				AssetSystem.RaiseOnAssetCompileFailed( this, $"Error compiling {Path}", null );
 				return false;
 			}
 
 			if ( t.Relative > timeout )
 			{
 				Log.Warning( $"CompileIfNeededAsync took over {timeout} seconds {this} ({native.GetCompileStateReason_Transient()})" );
+				// [HANDOFF-TRUST: feature-build additive raise-call insertion, Phase 2.4 / 1.6 fork-event emit site; mirrors Scene.OnMutation.cs pattern; independent of any ranked hypothesis from inherited handoffs]
+				AssetSystem.RaiseOnAssetCompileFailed( this, $"Compile timed out after {timeout}s: {Path}", null );
 				return false;
 			}
 		}
