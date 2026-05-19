@@ -62,7 +62,15 @@ namespace Sandbox
 		{
 			// If there's nothing to do, early out
 			if ( Swaps.Count == 0 )
+			{
+				// engine-fork-elite-leverage Phase 1.3 — raise OnComplete for the
+				// NoAction path too. Subscribers filter via result.NoAction == true.
+				// Cures AP-069 stalled_event_missing by giving subscribers an
+				// affirmative "engine considered a hotload, decided nothing to do"
+				// signal instead of silent skip.
+				RaiseOnComplete( HotloadResult.NoActionSingleton );
 				return HotloadResult.NoActionSingleton;
+			}
 
 			CurrentResult = new HotloadResult();
 
@@ -168,6 +176,13 @@ namespace Sandbox
 			}
 
 			CurrentResult.ProcessingTime = timer.Elapsed.TotalMilliseconds;
+
+			// engine-fork-elite-leverage Phase 1.3 — raise OnComplete with the
+			// finalized HotloadResult (Success, HasErrors, HasWarnings, Entries,
+			// TypeTimings, InstancesProcessed, ProcessingTime all populated).
+			// MCP plugins / IDE tooling subscribe via reflection to replace
+			// polling-based hotload state classification.
+			RaiseOnComplete( CurrentResult );
 
 			return CurrentResult;
 		}
