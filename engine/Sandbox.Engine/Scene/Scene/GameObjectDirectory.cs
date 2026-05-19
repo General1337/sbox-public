@@ -60,6 +60,11 @@ public sealed class GameObjectDirectory
 
 		componentsById[component.Id] = component;
 		OnComponentAdded?.Invoke( component );
+
+		// engine-fork Phase 1.5 — public static aggregate event for observability tooling.
+		// Fires AFTER the existing internal per-scene delegate so subscribers see consistent post-add state.
+		// [HANDOFF-TRUST: rename only — Added→Registered to avoid CS0108 with inherited GameObject.OnComponentAdded]
+		Scene.RaiseOnComponentRegistered( scene, component );
 	}
 
 	internal void Add( GameObject go )
@@ -78,6 +83,11 @@ public sealed class GameObjectDirectory
 
 		objectsById[go.Id] = go;
 		OnGameObjectAdded?.Invoke( go );
+
+		// engine-fork Phase 1.5 — public static aggregate event for observability tooling.
+		// [HANDOFF-TRUST: feature-build additive raise-call, no hypothesis dependency]
+		// Fires AFTER the existing internal per-scene delegate so subscribers see consistent post-add state.
+		Scene.RaiseOnGameObjectAdded( scene, go );
 	}
 
 	internal void Add( GameObjectSystem system, Guid previouslyKnownAs )
@@ -144,6 +154,12 @@ public sealed class GameObjectDirectory
 		}
 
 		componentsById.Remove( component.Id );
+
+		// engine-fork Phase 1.5 — public static aggregate event for observability tooling.
+		// [HANDOFF-TRUST: feature-build additive raise-call, no hypothesis dependency]
+		// Fires AFTER the dictionary removal so subscribers see consistent post-remove state.
+		// [HANDOFF-TRUST: rename only — Removed→Unregistered to avoid CS0108 with inherited GameObject.OnComponentRemoved]
+		Scene.RaiseOnComponentUnregistered( scene, component );
 	}
 
 	internal void Remove( GameObject go )
@@ -164,6 +180,11 @@ public sealed class GameObjectDirectory
 		}
 
 		objectsById.Remove( go.Id );
+
+		// engine-fork Phase 1.5 — public static aggregate event for observability tooling.
+		// [HANDOFF-TRUST: feature-build additive raise-call, no hypothesis dependency]
+		// Fires AFTER the dictionary removal so subscribers see consistent post-remove state.
+		Scene.RaiseOnGameObjectRemoved( scene, go );
 	}
 
 	/// <summary>
