@@ -61,6 +61,64 @@ public class CompileGroup : IDisposable
 		}
 	}
 
+	// ── engine-fork-elite-leverage Phase 1.2 (AP-100 second-pass cure) ────
+	// Sandbox++ engine-fork patch (NOT in Facepunch/sbox-public master).
+	// Companion to OnBuildCompleted (1.1) — fires immediately after with the
+	// FAILED compilers' outputs that 1.1 deliberately excludes from
+	// result.Output (see foreach loop below: `if (compiler.Output.Successful)`
+	// adds to result.Output; else-branch only emits to Log.Warning).
+	//
+	// Library subscribers (Arenula MCP) merge these failed outputs into their
+	// _lastOutputs cache so `compile.errors --severity=error` correctly
+	// returns CS0103/CS0246/etc. that previously only appeared in the
+	// warn-level Log.Warning stream as text-prefix "Error |".
+	//
+	// Ref: docs/ai/initiatives/engine-fork-elite-leverage/charter.md §"Phase 1 patch table" 1.2
+	// Ref: docs/ai/sessions/2026-05-18-engine-fork-phase1-2-compile-error-severity-stream/phase-01-design.md
+
+	/// <summary>
+	/// Fired once per <see cref="BuildAsync"/> completion immediately AFTER
+	/// <see cref="OnBuildCompleted"/>, but ONLY when one or more compilers in
+	/// this group failed (compiler.Output.Successful == false). Payload is the
+	/// array of failed compilers' CompilerOutputs. If all compilers succeeded,
+	/// this event does NOT fire (zero-emission for the happy path — subscribers
+	/// can rely on fire-implies-failure).
+	///
+	/// Companion to <see cref="OnBuildCompleted"/> (1.1), which delivers the
+	/// SUCCESSFUL outputs. The split mirrors result.Output (successful only)
+	/// and the per-compiler diagnostics emitted via Log.Warning at the failure
+	/// branch in <see cref="BuildAsync"/>. Subscribers should treat the failed
+	/// CompilerOutput[].Diagnostics as the canonical structured diagnostic
+	/// source — same data the engine's Log.Warning iteration reads from.
+	///
+	/// Handlers MUST NOT throw — exceptions are caught and logged. Handlers
+	/// run synchronously on the build's continuation thread; marshal heavy
+	/// work to your own thread.
+	///
+	/// Multi-subscriber safe (standard C# event semantics). On hotload, the
+	/// engine assembly persists (this class carries [SkipHotload]), so old
+	/// library subscribers remain attached unless the library explicitly -=
+	/// unsubscribes in its hotload handler.
+	/// </summary>
+	public static event Action<CompilerOutput[]> OnCompileFailed;
+
+	internal static void RaiseOnCompileFailed( CompilerOutput[] failedOutputs )
+	{
+		var handler = OnCompileFailed;
+		if ( handler == null ) return;
+		if ( failedOutputs == null || failedOutputs.Length == 0 ) return;
+
+		// Per-subscriber try/catch so one bad handler can't break the chain.
+		foreach ( var subscriber in handler.GetInvocationList() )
+		{
+			try { ((Action<CompilerOutput[]>)subscriber).Invoke( failedOutputs ); }
+			catch ( System.Exception e )
+			{
+				Log.Warning( $"CompileGroup.OnCompileFailed handler threw: {e.Message}" );
+			}
+		}
+	}
+
 	// Writes a marker file alongside Sandbox.Compiling.dll so the Sandbox++
 	// MCP library's msbuild can detect the fork at compile time via Exists().
 	// Marker content carries a schema version so future fork-engine bumps
@@ -365,6 +423,12 @@ public class CompileGroup : IDisposable
 			bool allSuccess = compileList.All( x => x.BuildResult?.Success ?? false );
 			result.Failed = !allSuccess;
 
+			// engine-fork-elite-leverage Phase 1.2 — capture failed compilers' outputs
+			// alongside the existing result.Output aggregation so a sibling event
+			// (RaiseOnCompileFailed) can deliver them to observability subscribers.
+			// result.Output stays successful-only to preserve the 1.1 invariant.
+			var failedOutputs = new List<CompilerOutput>();
+
 			foreach ( var compiler in toCompile.OrderBy( x => x.DependencyIndex() ) )
 			{
 				if ( compiler.Output is null )
@@ -378,6 +442,8 @@ public class CompileGroup : IDisposable
 				}
 				else
 				{
+					failedOutputs.Add( compiler.Output );
+
 					// if we were supressing build notifications then this was probably
 					// during startup. So print them so they show in the log file to give
 					// us a clue as to what's gone wrong.
@@ -401,6 +467,11 @@ public class CompileGroup : IDisposable
 			// event BEFORE the per-instance OnCompileFinished so subscribers see a
 			// consistent state (BuildResult populated, IsBuilding still true).
 			RaiseOnBuildCompleted( result.Output?.ToArray() ?? System.Array.Empty<CompilerOutput>() );
+
+			// engine-fork-elite-leverage Phase 1.2 — raise sibling event with failed
+			// outputs (zero-emission when all succeeded). Fires AFTER OnBuildCompleted
+			// so library subscribers can merge into a coherent _lastOutputs cache.
+			RaiseOnCompileFailed( failedOutputs.ToArray() );
 
 			OnCompileFinished.InvokeWithWarning();
 
