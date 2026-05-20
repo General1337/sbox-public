@@ -413,6 +413,12 @@ public abstract partial class Component : IJsonConvert, IComponentLister, IValid
 	{
 		try { OnValidate(); }
 		catch ( System.Exception e ) { Log.Error( e, $"Exception when calling 'OnValidate' on {this}" ); }
+
+		// engine-fork-elite-leverage Phase 1.5a — additive observability raise.
+		// OnValidateInternal is the editor-side property-change seam (inspector
+		// edits + post-deserialize), normally CallbackBatch-dispatched. See
+		// Component.OnPropertyChanged.cs for the full rationale. Additive only.
+		RaiseOnPropertyChanged( this );
 	}
 
 	internal void Validate()

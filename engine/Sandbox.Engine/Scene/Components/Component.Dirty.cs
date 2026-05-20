@@ -38,6 +38,12 @@ public abstract partial class Component
 		catch ( System.Exception e ) { Log.Error( e, $"Exception when calling 'OnDirty' on {this}" ); }
 
 		_dirty = false;
+
+		// engine-fork-elite-leverage Phase 1.5a — additive observability raise.
+		// OnDirtyInternal is the play-side property-change seam ([MakeDirty]
+		// property writes), CallbackBatch-dispatched via CommonCallback.Dirty.
+		// See Component.OnPropertyChanged.cs for the full rationale. Additive only.
+		RaiseOnPropertyChanged( this );
 	}
 
 	/// <summary>
