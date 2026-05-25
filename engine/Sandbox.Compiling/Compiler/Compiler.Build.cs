@@ -210,6 +210,19 @@ partial class Compiler
 			}
 		}
 
+		// FORK-PATCH (Sandbox++ — game-side analyzer support) — run project-shipped Roslyn analyzers, if any.
+		// Discovers DiagnosticAnalyzer types in loaded package.*.editor assemblies and
+		// surfaces their diagnostics into output. No-op when no analyzers ship. Runs
+		// AFTER generators (so generated code is in scope) and BEFORE the whitelist
+		// walker (so analyzers cannot smuggle blacklisted API usage). See
+		// Compiler.Analyzers.cs for full rationale and discovery convention.
+		RunProjectAnalyzers( compiler, output );
+
+		if ( output.Diagnostics.Any( x => x.Severity == DiagnosticSeverity.Error ) )
+		{
+			return;
+		}
+
 		// check for blacklisted methods/types used in compilation
 		// we need this because the c# compiler will post optimize and use tons of blacklisted methods
 		// run this after generators because they can contain user inputs too
