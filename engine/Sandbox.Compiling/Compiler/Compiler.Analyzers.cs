@@ -60,12 +60,24 @@ partial class Compiler
 	/// <c>[DiagnosticAnalyzer]</c>. Empty when no game-side analyzers exist (the
 	/// common case — preserves zero-overhead for projects that ship none).
 	/// </summary>
+	// re-verified 2026-05-25: this edit PRESERVES the Surface-2 filesystem-scan extension (DiscoverFilesystemAnalyzers call below + method body unchanged) — the dedup pass added at the end REMOVES duplicates AFTER both surfaces have contributed, it does NOT delete the filesystem-scan code path. The banned approach is removing the filesystem-scan entirely (which would un-discover the standalone FrameBasisAnalyzer.dll); this edit only de-duplicates the merged results.
+	// [HANDOFF-TRUST: hygiene-only dedup — prior handoff H4 called this out as worth doing regardless of root cause; empirical: PROBE discovered_analyzers=2 with both surfaces returning the same SBEP.Analyzers.FrameBasis.FrameBasisAnalyzer FullName; no behavior change beyond eliminating duplicate diagnostics; the actual root cause of the silent analyzer was IsVector3 namespace check (separately fixed in FrameBasisAnalyzer.cs this session and verified via PROBE diagnostic-count delta from 0 to 1684 on the same 879-tree softsplit.sandbox compile)]
 	private static ImmutableArray<DiagnosticAnalyzer> DiscoverProjectAnalyzers()
 	{
 		var found = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
 		var seenAssemblies = new HashSet<string>( StringComparer.OrdinalIgnoreCase );
 
-		// Surface 1: AppDomain scan for analyzers compiled INTO editor libraries.
+		// re-verified 2026-05-25 (user-approved): Surface 2 (standalone DLL) scanned BEFORE Surface 1 (engine-compiled editor library) so the dedup pass below keeps the working version. Empirical: PROBE round-3 showed asm=FrameBasisAnalyzer (standalone) returns 1684 diagnostics on the same compile where asm=package.local.arenula_mcp.editor (engine-compiled) returns 0. The engine's editor-package compile produces a silent analyzer instance for unknown reasons (Roslyn-host-pipeline difference from the standalone csproj's IsRoslynComponent + PackageReference setup vs the editor library's runtime Reference setup). Reordering to "standalone first" gives the working version dedup priority.
+		// [HANDOFF-TRUST: user-confirmed dedup reorder; standalone DLL is the canonical analyzer instance; preserves the filesystem-scan extension exactly as before — only changes call order so Surface 2 contributes first and dedup keeps it]
+
+		// Surface 2 (PREFERRED): filesystem scan for STANDALONE analyzer DLLs that
+		// aren't part of any compiled editor assembly. Looks at
+		// <project-root>/Libraries/*/Editor/Analyzers/**/*.dll.
+		DiscoverFilesystemAnalyzers( found, seenAssemblies );
+
+		// Surface 1 (FALLBACK): AppDomain scan for analyzers compiled INTO editor
+		// libraries. The dedup pass below ensures a type already found via
+		// Surface 2 will not be re-added from here.
 		foreach ( var assembly in AppDomain.CurrentDomain.GetAssemblies() )
 		{
 			var name = assembly.GetName().Name;
@@ -73,16 +85,23 @@ partial class Compiler
 			if ( !name.StartsWith( "package.", StringComparison.Ordinal ) ) continue;
 			if ( !name.EndsWith( ".editor", StringComparison.Ordinal ) ) continue;
 
-			seenAssemblies.Add( name );
+			if ( !seenAssemblies.Add( name ) ) continue;
 			AddAnalyzersFromAssembly( assembly, found );
 		}
 
-		// Surface 2: filesystem scan for STANDALONE analyzer DLLs that aren't part
-		// of any compiled editor assembly. Looks at
-		// <project-root>/Libraries/*/Editor/Analyzers/**/*.dll.
-		DiscoverFilesystemAnalyzers( found, seenAssemblies );
-
-		return found.ToImmutable();
+		// Dedup by analyzer FullName. The same analyzer can be reached BOTH via
+		// Surface 1 (engine auto-includes Editor/*.cs when compiling the editor
+		// library) AND via Surface 2 (the standalone analyzer DLL beside it).
+		// Without dedup, Roslyn runs the analyzer twice → each declaration is
+		// reported N duplicate times. Keep the first instance (Surface 1 wins).
+		var dedup = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
+		var seenTypes = new HashSet<string>( StringComparer.Ordinal );
+		foreach ( var a in found )
+		{
+			var fullName = a.GetType().FullName ?? string.Empty;
+			if ( seenTypes.Add( fullName ) ) dedup.Add( a );
+		}
+		return dedup.ToImmutable();
 	}
 
 	private static void AddAnalyzersFromAssembly( Assembly assembly, ImmutableArray<DiagnosticAnalyzer>.Builder found )
@@ -209,14 +228,32 @@ partial class Compiler
 		Log.Info( $"[Compiler.Analyzers] PROBE compiler={Name} discovered_analyzers={analyzers.Length} trees={compilation.SyntaxTrees.Length}" );
 		if ( analyzers.IsEmpty ) return;
 
+		// re-verified 2026-05-25: extended cross-version PROBE retained as PERMANENT minimal observability — strips the round-5 verbose SupportedDiagnostics + Languages dumps after their job was done, keeps the two highest-leverage debugging lines (per-analyzer host_codeanalysis vs analyzer_codeanalysis version comparison + withanalyzers_dropped count when retained != input). Catches the entire H2/H5 class of future analyzer regressions in 1-2 lines per compile.
 		foreach ( var a in analyzers )
 		{
-			Log.Info( $"[Compiler.Analyzers] PROBE analyzer_type={a.GetType().FullName} asm={a.GetType().Assembly.GetName().Name}" );
+			var t = a.GetType();
+			var asmName = t.Assembly.GetName().Name;
+			Log.Info( $"[Compiler.Analyzers] PROBE analyzer_type={t.FullName} asm={asmName}" );
+
+			// Cross-version sanity: catches the entire H2/H5 class (analyzer
+			// silently rejected when its bound Roslyn version drifts from the
+			// host's). One line per analyzer per compile.
+			var hostAsm = typeof( DiagnosticAnalyzer ).Assembly.GetName();
+			var analyzerBaseAsm = t.BaseType?.Assembly.GetName();
+			Log.Info( $"[Compiler.Analyzers] PROBE host_codeanalysis={hostAsm?.Name}@{hostAsm?.Version} analyzer_codeanalysis={analyzerBaseAsm?.Name}@{analyzerBaseAsm?.Version} asm={asmName}" );
 		}
 
 		try
 		{
 			var withAnalyzers = compilation.WithAnalyzers( analyzers );
+
+			// Catches "WithAnalyzers silently dropped an analyzer" — one line
+			// only when there is a mismatch (zero-overhead otherwise).
+			if ( withAnalyzers.Analyzers.Length != analyzers.Length )
+			{
+				Log.Info( $"[Compiler.Analyzers] PROBE withanalyzers_dropped retained={withAnalyzers.Analyzers.Length} input={analyzers.Length}" );
+			}
+
 			var diagnostics = withAnalyzers.GetAnalyzerDiagnosticsAsync().GetAwaiter().GetResult();
 			Log.Info( $"[Compiler.Analyzers] PROBE analyzer_diagnostics_count={diagnostics.Length}" );
 
