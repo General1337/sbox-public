@@ -5,8 +5,8 @@ This is a **narrowly-scoped fork** of `Facepunch/sbox-public`, maintained for th
 development loop. It adds observability seams the published engine does not expose.
 
 - **Branch:** `codex/hotload-full-fallback`
-- **Upstream base:** `0344b0ba` (`Facepunch/sbox-public` master)
-- **Delta:** 10 commits — 9 substantive patches + 1 merge
+- **Upstream base:** `7091711f` (`Facepunch/sbox-public` master, synced 2026-06-04 from `0344b0ba`)
+- **Delta:** 13 commits — 11 patch commits (9 logical patches; the analyzer-loader patch spans 3) + 2 merges (`b63d549b`, `29ffbc5a`)
 - **Remotes:** `origin` = `General1337/sbox-public`, `upstream` = `Facepunch/sbox-public`
 - **Status:** permanently fork-only — the project does not open Facepunch PRs (owner decision 2026-05-20).
 
