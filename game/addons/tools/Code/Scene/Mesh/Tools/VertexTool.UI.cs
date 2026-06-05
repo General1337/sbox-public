@@ -459,6 +459,41 @@ partial class VertexTool
 			}
 		}
 
+		[Shortcut( "mesh.select-loop", "L", typeof( SceneViewWidget ) )]
+		private void SelectLoop()
+		{
+			if ( _vertices.Length < 2 )
+				return;
+
+			using var scope = SceneEditorSession.Scope();
+
+			using ( SceneEditorSession.Active.UndoScope( "Select Vertex Loop" ).Push() )
+			{
+				var selection = SceneEditorSession.Active.Selection;
+				selection.Clear();
+
+				foreach ( var group in _vertexGroups )
+				{
+					var mesh = group.Key.Mesh;
+					var verts = group.Select( x => x.Handle ).ToArray();
+
+					var edges = verts.SelectMany( ( v, i ) => verts.Skip( i + 1 )
+						.Select( w => mesh.FindEdgeConnectingVertices( v, w ) ) )
+						.Where( e => e.IsValid )
+						.ToArray();
+
+					if ( edges.Length == 0 )
+						continue;
+
+					mesh.FindEdgeLoopForEdges( edges, out var edgeLoop );
+					mesh.FindVerticesConnectedToEdges( edgeLoop, out var loopVertices );
+
+					foreach ( var hVertex in loopVertices )
+						selection.Add( new MeshVertex( group.Key, hVertex ) );
+				}
+			}
+		}
+
 		[Shortcut( "mesh.snap-to-grid", "CTRL+B", typeof( SceneViewWidget ) )]
 		private void SnapToGrid()
 		{
