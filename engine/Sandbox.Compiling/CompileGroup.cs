@@ -272,7 +272,7 @@ public class CompileGroup : IDisposable
 	}
 
 	/// <summary>
-	/// Mark this assembly as changed.
+	/// Recompile <paramref name="compiler"/> as soon as is appropriate.
 	/// </summary>
 	internal void MarkForRecompile( Compiler compiler )
 	{
@@ -280,6 +280,14 @@ public class CompileGroup : IDisposable
 		{
 			log.Trace( $"MarkForRecompile ({compiler.Name})" );
 		}
+	}
+
+	/// <summary>
+	/// No longer want/need to recompile <paramref name="compiler"/>.
+	/// </summary>
+	internal void ClearForRecompile( Compiler compiler )
+	{
+		_recompileList.Remove( compiler );
 	}
 
 	/// <summary>
@@ -420,7 +428,7 @@ public class CompileGroup : IDisposable
 			//
 			// Accumulate the build result
 			//
-			bool allSuccess = compileList.All( x => x.BuildResult?.Success ?? false );
+			bool allSuccess = compileList.All( x => x.BuildSuccess );
 			result.Failed = !allSuccess;
 
 			// engine-fork-elite-leverage Phase 1.2 — capture failed compilers' outputs
