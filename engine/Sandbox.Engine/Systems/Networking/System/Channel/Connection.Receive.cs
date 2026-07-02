@@ -63,7 +63,12 @@ public abstract partial class Connection
 
 		if ( index + 1 > total ) throw new InvalidDataException( $"chunkIndex {index} >= total {total}" );
 		if ( total <= 1 ) throw new InvalidDataException( "Chunk total must be > 1" );
-		if ( total > 1024 ) throw new InvalidDataException( $"Chunk total {total} exceeds 1024 limit" );
+		// FORK (2026-07-02): raised 1024 -> 8192. A -joinlocal client joining an editor host
+		// running a large local project receives the network-files payload as ONE chunked
+		// message; sandbox-plus-plus's payload is ~1800 chunks, which the upstream 1024 guard
+		// rejected on the RECEIVE side while the sender chunked it happily (packets dropped in
+		// a loop, handshake never completes). Receive-side only — wire format unchanged.
+		if ( total > 8192 ) throw new InvalidDataException( $"Chunk total {total} exceeds 8192 limit" );
 
 		if ( index == 0 )
 		{
