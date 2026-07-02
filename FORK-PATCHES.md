@@ -5,8 +5,8 @@ This is a **narrowly-scoped fork** of `Facepunch/sbox-public`, maintained for th
 development loop. It adds observability seams the published engine does not expose.
 
 - **Branch:** `codex/hotload-full-fallback`
-- **Upstream base:** `7091711f` (`Facepunch/sbox-public` master, synced 2026-06-04 from `0344b0ba`)
-- **Delta:** 13 commits — 11 patch commits (9 logical patches; the analyzer-loader patch spans 3) + 2 merges (`b63d549b`, `29ffbc5a`)
+- **Upstream base:** `91762136` (`Facepunch/sbox-public` master, synced 2026-07-02 from `7091711f`; prior bases `0344b0ba` 2026-06-04, then `7091711f`)
+- **Delta:** 15 commits ahead of `91762136` — all 9 logical patches (analyzer-loader spans 3) present + 3 merges (`b63d549b`, `29ffbc5a`, `2548927c`)
 - **Remotes:** `origin` = `General1337/sbox-public`, `upstream` = `Facepunch/sbox-public`
 - **Status:** permanently fork-only — the project does not open Facepunch PRs (owner decision 2026-05-20).
 
@@ -61,6 +61,13 @@ checkout. The patches are verified instead via the game-side Tier-3 regression
 ConCmds (`sbep.test_compile_on_build_completed`, `sbep.test_hotload_on_complete`,
 `sbep.test_scene_mutation_events`, etc.) run on the Bootstrapped fork editor, and via
 the engine-fork CI (`sandbox-plus-plus/.github/workflows/engine-fork-ci.yml`).
+
+**Last re-certified 2026-07-02** (merge `2548927c`, base `91762136`): Bootstrap compile-clean;
+all 6 fork-event regression ConCmds PASS (`compile_on_build_completed`, `compile_error_severity`,
+`hotload_on_complete`, `typelibrary_on_registered`, `scene_mutation_events`,
+`component_property_changed`); `feed channels` shows compile/scene/assets `available:true`; and the
+`FrameBasisAnalyzer` positively re-verified live (a deliberate `WorldVec3 + ShipLocalVec3` probe
+fired `FBA002` on an in-engine compile).
 
 ## Adding a patch
 
