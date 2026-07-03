@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Sandbox.Clutter;
 
 /// <summary>
@@ -11,11 +13,16 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 	/// </summary>
 	private readonly Dictionary<ClutterComponent, ClutterLayer> _componentToLayer = [];
 
-	private const int MAX_JOBS_PER_FRAME = 8;
+	private const int MAX_COMPLETED_JOBS_PER_FRAME = 8;
 	private const int MAX_PENDING_JOBS = 100;
+	private const float MIN_STREAMING_BUDGET_MS = 0.1f;
+
+	[ConVar( "clutter_stream_budget_ms", ConVarFlags.Cheat )]
+	internal static float StreamingBudgetMs { get; set; } = 1.5f;
 
 	private readonly List<ClutterGenerationJob> _pendingJobs = [];
 	private readonly HashSet<ClutterTile> _pendingTiles = [];
+	private readonly HashSet<ClutterLayer> _layersPendingRebuild = [];
 	private readonly HashSet<Terrain> _subscribedTerrains = [];
 	private Vector3 _lastCameraPosition;
 
@@ -130,6 +137,9 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 
 			foreach ( var job in layer.UpdateTiles( cameraPosition ) )
 				QueueJob( job );
+
+			if ( layer.IsDirty )
+				_layersPendingRebuild.Add( layer );
 		}
 	}
 
@@ -141,7 +151,9 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 
 		foreach ( var component in toRemove )
 		{
-			_componentToLayer[component].ClearAllTiles();
+			var layer = _componentToLayer[component];
+			layer.ClearAllTiles();
+			_layersPendingRebuild.Remove( layer );
 			_componentToLayer.Remove( component );
 		}
 	}
@@ -191,6 +203,7 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 		if ( _componentToLayer.Remove( component, out var layer ) )
 		{
 			layer.ClearAllTiles();
+			_layersPendingRebuild.Remove( layer );
 		}
 	}
 
@@ -285,8 +298,12 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 
 	private void ProcessJobs()
 	{
+		var deadlineTimestamp = CreateStreamingDeadline();
 		if ( _pendingJobs.Count == 0 )
+		{
+			ProcessPendingRebuilds( deadlineTimestamp );
 			return;
+		}
 
 		// Track which layers had tiles populated
 		HashSet<ClutterLayer> layersToRebuild = [];
@@ -314,32 +331,81 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 		}
 
 		// Process nearest tiles first
-		int processed = 0;
-		while ( processed < MAX_JOBS_PER_FRAME && _pendingJobs.Count > 0 )
+		int completed = 0;
+		while ( completed < MAX_COMPLETED_JOBS_PER_FRAME && _pendingJobs.Count > 0 )
 		{
 			var job = _pendingJobs[0];
+
+			if ( !job.Parent.IsValid() || job.Tile?.IsPopulated == true )
+			{
+				_pendingJobs.RemoveAt( 0 );
+				if ( job.Tile != null )
+					_pendingTiles.Remove( job.Tile );
+				continue;
+			}
+
+			if ( completed > 0 && Stopwatch.GetTimestamp() >= deadlineTimestamp )
+				break;
+
+			if ( !job.ExecuteBudgeted( deadlineTimestamp ) )
+				break;
+
 			_pendingJobs.RemoveAt( 0 );
 
 			if ( job.Tile != null )
 				_pendingTiles.Remove( job.Tile );
 
-			// Execute if still valid and not populated
-			if ( job.Parent.IsValid() && job.Tile?.IsPopulated != true )
-			{
-				job.Execute();
-				processed++;
+			completed++;
 
-				if ( job.Layer != null )
-					layersToRebuild.Add( job.Layer );
+			if ( job.Layer != null )
+			{
+				layersToRebuild.Add( job.Layer );
 			}
 		}
 
-		// Rebuild batches for layers that had tiles populated
 		foreach ( var layer in layersToRebuild )
 		{
-			layer.RebuildBatches();
+			_layersPendingRebuild.Add( layer );
 		}
 
+		ProcessPendingRebuilds( deadlineTimestamp );
+		TrimPendingJobs();
+	}
+
+	private static long CreateStreamingDeadline()
+	{
+		var budgetMs = StreamingBudgetMs;
+		if ( !float.IsFinite( budgetMs ) || budgetMs < MIN_STREAMING_BUDGET_MS )
+			budgetMs = MIN_STREAMING_BUDGET_MS;
+
+		var budgetTicks = Math.Max( 1L, (long)(budgetMs * Stopwatch.Frequency / 1000.0f) );
+		var now = Stopwatch.GetTimestamp();
+		return long.MaxValue - now <= budgetTicks ? long.MaxValue : now + budgetTicks;
+	}
+
+	private void ProcessPendingRebuilds( long deadlineTimestamp )
+	{
+		foreach ( var layer in _layersPendingRebuild.ToArray() )
+		{
+			if ( Stopwatch.GetTimestamp() >= deadlineTimestamp )
+				break;
+
+			if ( layer == null )
+			{
+				_layersPendingRebuild.Remove( layer );
+				continue;
+			}
+
+			if ( layer.IsDirty )
+				layer.RebuildBatches();
+
+			if ( !layer.IsDirty )
+				_layersPendingRebuild.Remove( layer );
+		}
+	}
+
+	private void TrimPendingJobs()
+	{
 		var infiniteJobs = _pendingJobs.Where( j => j.Tile != null ).ToList();
 		if ( infiniteJobs.Count > MAX_PENDING_JOBS )
 		{

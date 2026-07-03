@@ -73,49 +73,128 @@ class ClutterGenerationJob
 	public BBox? LocalBounds { get; init; }
 	public Transform? VolumeTransform { get; init; }
 
+	private bool _started;
+	private bool _completed;
+	private bool _completeNotified;
+	private int _resolvedSeed;
+	private TerrainMaterialScatterer.TerrainMaterialScatterWork _terrainMaterialWork;
+
 	/// <summary>
 	/// Execute the generation job.
 	/// </summary>
 	public void Execute()
 	{
+		ExecuteBudgeted( long.MaxValue );
+	}
+
+	/// <summary>
+	/// Executes this job until it completes or the supplied Stopwatch timestamp deadline is reached.
+	/// Returns true when the job is complete and can be removed from the queue.
+	/// </summary>
+	public bool ExecuteBudgeted( long deadlineTimestamp )
+	{
+		if ( _completed )
+			return true;
+
 		try
 		{
 			if ( !Parent.IsValid() )
-				return;
-
-			int seed = Seed;
-			if ( Tile != null )
 			{
-				Tile.Destroy();
-				Layer?.ClearTileModelInstances( Tile.Coordinates );
-
-				seed = Scatterer.GenerateSeed( Tile.SeedOffset, Tile.Coordinates.x, Tile.Coordinates.y );
+				_completed = true;
+				return true;
 			}
 
-			var instances = Clutter.Scatterer.HasValue
-				? Clutter.Scatterer.Value.Scatter( Bounds, Clutter, seed, Parent.Scene )
-				: null;
+			BeginGeneration();
 
-			if ( LocalBounds.HasValue && VolumeTransform.HasValue )
+			if ( _terrainMaterialWork is not null )
 			{
-				var volumeTransform = VolumeTransform.Value;
-				var localBounds = LocalBounds.Value;
-				instances?.RemoveAll( i => !localBounds.Contains( volumeTransform.PointToLocal( i.Transform.Position ) ) );
+				if ( !_terrainMaterialWork.ExecuteUntil( deadlineTimestamp ) )
+					return false;
+
+				FinishGeneration( _terrainMaterialWork.Instances );
+				return true;
 			}
 
-			if ( instances is { Count: > 0 } )
-				SpawnInstances( instances );
-
-			if ( Tile != null )
-			{
-				Tile.IsPopulated = true;
-				Layer?.OnTilePopulated( Tile );
-			}
+			FinishGeneration( GenerateInstancesSynchronous() );
+			return true;
+		}
+		catch
+		{
+			_completed = true;
+			throw;
 		}
 		finally
 		{
-			OnComplete?.Invoke();
+			if ( _completed )
+				NotifyComplete();
 		}
+	}
+
+	private void BeginGeneration()
+	{
+		if ( _started )
+			return;
+
+		_started = true;
+		_resolvedSeed = Seed;
+
+		if ( Tile != null )
+			_resolvedSeed = Scatterer.GenerateSeed( Tile.SeedOffset, Tile.Coordinates.x, Tile.Coordinates.y );
+
+		if ( Tile != null
+			&& !LocalBounds.HasValue
+			&& !VolumeTransform.HasValue
+			&& Clutter.Scatterer.HasValue
+			&& Clutter.Scatterer.Value is TerrainMaterialScatterer terrainMaterialScatterer )
+		{
+			_terrainMaterialWork = terrainMaterialScatterer.CreateStreamingWork( Bounds, Clutter, _resolvedSeed, Parent.Scene );
+		}
+	}
+
+	private List<ClutterInstance> GenerateInstancesSynchronous()
+	{
+		return Clutter.Scatterer.HasValue
+			? Clutter.Scatterer.Value.Scatter( Bounds, Clutter, _resolvedSeed, Parent.Scene )
+			: null;
+	}
+
+	private void FinishGeneration( List<ClutterInstance> instances )
+	{
+		if ( _completed )
+			return;
+
+		if ( LocalBounds.HasValue && VolumeTransform.HasValue )
+		{
+			var volumeTransform = VolumeTransform.Value;
+			var localBounds = LocalBounds.Value;
+			instances?.RemoveAll( i => !localBounds.Contains( volumeTransform.PointToLocal( i.Transform.Position ) ) );
+		}
+
+		if ( Tile != null )
+		{
+			Tile.Destroy();
+			Layer?.ClearTileModelInstances( Tile.Coordinates );
+		}
+
+		if ( instances is { Count: > 0 } )
+			SpawnInstances( instances );
+
+		if ( Tile != null )
+		{
+			Tile.IsPopulated = true;
+			Layer?.OnTilePopulated( Tile );
+		}
+
+		_completed = true;
+	}
+
+	private void NotifyComplete()
+	{
+		if ( _completeNotified )
+			return;
+
+		_completeNotified = true;
+		OnComplete?.Invoke();
 	}
 
 	internal static PhysicsBody CreateStaticBodyForVolume( Model model, Transform transform, Scene scene )

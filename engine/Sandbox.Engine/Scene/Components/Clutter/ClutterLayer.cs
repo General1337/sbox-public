@@ -19,13 +19,15 @@ class ClutterLayer
 	private Dictionary<Vector2Int, List<ClutterInstance>> ModelInstancesByTile { get; } = [];
 
 	/// <summary>
-	/// Batches organized by model. LOD is computed on the GPU per view, so batches are keyed by model.
+	/// Batches organized by tile and model. Keeping streamed tiles separate avoids re-uploading
+	/// the entire model instance list when a single infinite tile changes.
 	/// </summary>
-	private readonly Dictionary<Model, ClutterBatchSceneObject> _batches = [];
+	private readonly Dictionary<(Vector2Int TileCoord, Model Model), ClutterBatchSceneObject> _batches = [];
 
-	private readonly Dictionary<Model, List<Transform>> _instancesByModel = [];
-	private readonly HashSet<Model> _activeModels = [];
-	private readonly List<Model> _staleModels = [];
+	private readonly HashSet<Vector2Int> _dirtyTiles = [];
+	private readonly Dictionary<Model, List<Transform>> _transformsByModelScratch = [];
+	private readonly HashSet<Model> _activeModelsScratch = [];
+	private readonly List<(Vector2Int TileCoord, Model Model)> _staleBatchKeys = [];
 
 	private readonly HashSet<Vector2Int> _activeCoords = [];
 	private readonly List<Vector2Int> _coordsToRemove = [];
@@ -40,7 +42,10 @@ class ClutterLayer
 
 	private int _lastSettingsHash;
 	private const float TileHeight = 50000f;
+	private const int MaxDirtyTilesPerRebuild = 4;
 	private bool _dirty = false;
+
+	public bool IsDirty => _dirty;
 
 	public ClutterLayer( ClutterSettings settings, GameObject parentObject, ClutterGridSystem gridSystem )
 	{
@@ -126,9 +131,6 @@ class ClutterLayer
 		}
 		if ( _coordsToRemove.Count > 0 ) _dirty = true;
 
-		if ( _dirty && jobs.Count == 0 )
-			RebuildBatches();
-
 		return jobs;
 	}
 
@@ -151,7 +153,12 @@ class ClutterLayer
 	/// </summary>
 	public void ClearTileModelInstances( Vector2Int tileCoord )
 	{
-		ModelInstancesByTile.Remove( tileCoord );
+		if ( ModelInstancesByTile.Remove( tileCoord ) )
+		{
+			_dirtyTiles.Add( tileCoord );
+			_dirty = true;
+		}
+
 		RemoveBodies( tileCoord );
 	}
 
@@ -169,6 +176,9 @@ class ClutterLayer
 		}
 
 		instances.Add( instance );
+
+		_dirtyTiles.Add( tileCoord );
+		_dirty = true;
 
 		TryCreateBody( tileCoord, instance );
 	}
@@ -245,53 +255,69 @@ class ClutterLayer
 		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
 		if ( scene?.SceneWorld == null ) { _dirty = false; return; }
 
-		foreach ( var list in _instancesByModel.Values )
-			list.Clear();
+		var rebuiltTiles = 0;
+		foreach ( var tileCoord in _dirtyTiles.ToArray() )
+		{
+			RebuildTileBatches( scene, tileCoord );
+			_dirtyTiles.Remove( tileCoord );
 
-		_activeModels.Clear();
+			rebuiltTiles++;
+			if ( rebuiltTiles >= MaxDirtyTilesPerRebuild )
+				break;
+		}
 
-		foreach ( var (tileCoord, instances) in ModelInstancesByTile )
+		_dirty = _dirtyTiles.Count > 0;
+	}
+
+	private void RebuildTileBatches( Scene scene, Vector2Int tileCoord )
+	{
+		_transformsByModelScratch.Clear();
+		_activeModelsScratch.Clear();
+
+		if ( ModelInstancesByTile.TryGetValue( tileCoord, out var instances ) )
 		{
 			foreach ( var instance in instances )
 			{
-				if ( instance.Entry?.Model == null ) continue;
+				var model = instance.Entry?.Model;
+				if ( model == null )
+					continue;
 
-				var model = instance.Entry.Model;
-				_activeModels.Add( model );
+				_activeModelsScratch.Add( model );
 
-				if ( !_instancesByModel.TryGetValue( model, out var list ) )
+				if ( !_transformsByModelScratch.TryGetValue( model, out var transforms ) )
 				{
-					list = [];
-					_instancesByModel[model] = list;
+					transforms = [];
+					_transformsByModelScratch[model] = transforms;
 				}
 
-				list.Add( instance.Transform );
+				transforms.Add( instance.Transform );
 			}
 		}
 
-		foreach ( var model in _activeModels )
+		foreach ( var (model, transforms) in _transformsByModelScratch )
 		{
-			if ( !_batches.TryGetValue( model, out var batch ) )
+			var key = (tileCoord, model);
+			if ( !_batches.TryGetValue( key, out var batch ) )
 			{
 				batch = new ClutterBatchSceneObject( scene.SceneWorld, model );
-				_batches[model] = batch;
+				_batches[key] = batch;
 			}
 
-			batch.SetInstances( _instancesByModel[model] );
+			batch.SetInstances( transforms );
 		}
 
-		// Remove batches whose model no longer has any instances.
-		_staleModels.Clear();
-		foreach ( var model in _batches.Keys )
-			if ( !_activeModels.Contains( model ) ) _staleModels.Add( model );
-
-		foreach ( var model in _staleModels )
+		_staleBatchKeys.Clear();
+		foreach ( var key in _batches.Keys )
 		{
-			_batches[model].Delete();
-			_batches.Remove( model );
+			if ( key.TileCoord == tileCoord && !_activeModelsScratch.Contains( key.Model ) )
+				_staleBatchKeys.Add( key );
 		}
 
-		_dirty = false;
+		foreach ( var key in _staleBatchKeys )
+		{
+			_batches[key].Delete();
+			_batches.Remove( key );
+		}
 	}
 
 	public void ClearAllTiles()
@@ -312,7 +338,7 @@ class ClutterLayer
 			batch.Delete();
 
 		_batches.Clear();
-		_instancesByModel.Clear();
+		_dirtyTiles.Clear();
 		_dirty = false;
 	}
 

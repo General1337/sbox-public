@@ -97,7 +97,19 @@ public abstract class Scatterer
 	/// </summary>
 	protected ClutterEntry GetRandomEntry( ClutterDefinition clutter )
 	{
+		return GetRandomEntry( clutter, Random );
+	}
+
+	/// <summary>
+	/// Selects a random entry from the clutter using the supplied deterministic random stream.
+	/// </summary>
+	protected ClutterEntry GetRandomEntry( ClutterDefinition clutter, Random random )
+	{
 		if ( clutter.IsEmpty )
+			return null;
+
+		random ??= Random;
+		if ( random is null )
 			return null;
 
 		var totalWeight = 0f;
@@ -109,7 +121,7 @@ public abstract class Scatterer
 
 		if ( totalWeight is 0 ) return null;
 
-		var randomValue = Random.Float( 0f, totalWeight );
+		var randomValue = random.Float( 0f, totalWeight );
 		var currentWeight = 0f;
 
 		foreach ( var entry in clutter.Entries )
@@ -173,6 +185,14 @@ public abstract class Scatterer
 	/// <returns>Number of points to generate</returns>
 	protected int CalculatePointCount( BBox bounds, float density, int maxPoints = 10000 )
 	{
+		return CalculatePointCount( bounds, density, Random, maxPoints );
+	}
+
+	/// <summary>
+	/// Calculates the number of points to scatter using the supplied deterministic random stream.
+	/// </summary>
+	protected int CalculatePointCount( BBox bounds, float density, Random random, int maxPoints = 10000 )
+	{
 		// Convert bounds from engine units (inches) to meters
 		// 1 inch = 0.0254 meters
 		var widthMeters = bounds.Size.x.InchToMeter();
@@ -187,7 +207,8 @@ public abstract class Scatterer
 		var fractionalPart = desiredCount - guaranteedPoints;
 
 		var finalCount = guaranteedPoints;
-		if ( Random.Float( 0f, 1f ) < fractionalPart )
+		random ??= Random;
+		if ( random is not null && random.Float( 0f, 1f ) < fractionalPart )
 		{
 			finalCount++;
 		}
