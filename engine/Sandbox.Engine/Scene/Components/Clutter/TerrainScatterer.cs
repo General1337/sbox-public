@@ -84,6 +84,9 @@ public class SlopeScatterer : Scatterer
 		var pointCount = CalculatePointCount( bounds, Density );
 		var instances = new List<ClutterInstance>( pointCount );
 
+		// Hoist the trace Z envelope once — see Scatterer.TraceGround docs.
+		var (traceZMin, traceZMax) = ResolveTraceZRange( scene, bounds );
+
 		for ( int i = 0; i < pointCount; i++ )
 		{
 			var point = new Vector3(
@@ -93,7 +96,7 @@ public class SlopeScatterer : Scatterer
 			);
 
 			// Trace to ground
-			var trace = TraceGround( scene, point );
+			var trace = TraceGround( scene, point, traceZMin, traceZMax );
 			if ( !trace.Hit )
 				continue;
 
@@ -275,9 +278,13 @@ public class TerrainMaterialScatterer : Scatterer
 		var pointCount = CalculatePointCount( bounds, Density );
 		var instances = new List<ClutterInstance>( pointCount );
 
+		// Hoist the trace Z envelope once for the whole job — replaces the per-point
+		// scene.GetBounds() walk that was O(points) x O(scene-components-with-IHasBounds).
+		var (traceZMin, traceZMax) = ResolveTraceZRange( scene, bounds );
+
 		for ( int i = 0; i < pointCount; i++ )
 		{
-			if ( TryCreateInstance( bounds, clutter, scene, Random, ref _cachedTerrainObject, ref _cachedTerrain, out var instance ) )
+			if ( TryCreateInstance( bounds, clutter, scene, Random, traceZMin, traceZMax, ref _cachedTerrainObject, ref _cachedTerrain, out var instance ) )
 				instances.Add( instance );
 		}
 
@@ -295,6 +302,8 @@ public class TerrainMaterialScatterer : Scatterer
 		ClutterDefinition clutter,
 		Scene scene,
 		Random random,
+		float traceZMin,
+		float traceZMax,
 		ref GameObject cachedTerrainObject,
 		ref Terrain cachedTerrain,
 		out ClutterInstance instance )
@@ -310,7 +319,7 @@ public class TerrainMaterialScatterer : Scatterer
 			0f
 		);
 
-		var trace = TraceGround( scene, point );
+		var trace = TraceGround( scene, point, traceZMin, traceZMax );
 		if ( !trace.Hit )
 			return false;
 
@@ -490,6 +499,12 @@ public class TerrainMaterialScatterer : Scatterer
 		private readonly int _pointCount;
 		private readonly List<ClutterInstance> _instances;
 
+		// Trace Z envelope resolved ONCE at job creation via ResolveTraceZRange — see Scatterer.cs.
+		// Prevents the streaming work item from calling scene.GetBounds() per-point (was the fill-time
+		// killer on Eden because the solar-system-scale scene has thousands of IHasBounds components).
+		private readonly float _traceZMin;
+		private readonly float _traceZMax;
+
 		private GameObject _cachedTerrainObject;
 		private Terrain _cachedTerrain;
 		private int _nextPoint;
@@ -509,6 +524,8 @@ public class TerrainMaterialScatterer : Scatterer
 				return;
 			}
 
+			(_traceZMin, _traceZMax) = ResolveTraceZRange( scene, bounds );
+
 			_pointCount = scatterer.CalculatePointCount( bounds, scatterer.Density, _random );
 			_instances = new List<ClutterInstance>( _pointCount );
 		}
@@ -524,7 +541,7 @@ public class TerrainMaterialScatterer : Scatterer
 				if ( processed > 0 && processed % BudgetCheckInterval == 0 && Stopwatch.GetTimestamp() >= deadlineTimestamp )
 					return false;
 
-				if ( _scatterer.TryCreateInstance( _bounds, _clutter, _scene, _random, ref _cachedTerrainObject, ref _cachedTerrain, out var instance ) )
+				if ( _scatterer.TryCreateInstance( _bounds, _clutter, _scene, _random, _traceZMin, _traceZMax, ref _cachedTerrainObject, ref _cachedTerrain, out var instance ) )
 					_instances.Add( instance );
 
 				_nextPoint++;

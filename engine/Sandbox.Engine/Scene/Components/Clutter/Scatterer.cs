@@ -149,18 +149,57 @@ public abstract class Scatterer
 
 	/// <summary>
 	/// Helper to perform a ground trace at a position.
+	/// <para>
+	/// Prefer the (scene, position, zMin, zMax) overload from a scatterer's inner loop:
+	/// <c>scene.GetBounds()</c> walks every <c>IHasBounds</c> component in the scene, so calling it
+	/// per point is pathological in solar-system-scale scenes (ClutterGridSystem.ProcessJobs
+	/// invokes this thousands of times per streaming tile). Hoist the trace Z range once per
+	/// generation job / streaming work item and pass it in.
+	/// </para>
 	/// </summary>
 	protected static SceneTraceResult TraceGround( Scene scene, Vector3 position )
 	{
 		// Use scene bounds to determine trace extent
 		var sceneBounds = scene.GetBounds();
-		var traceStart = position.WithZ( sceneBounds.Maxs.z );
-		var traceEnd = position.WithZ( sceneBounds.Mins.z );
+		return TraceGround( scene, position, sceneBounds.Mins.z, sceneBounds.Maxs.z );
+	}
+
+	/// <summary>
+	/// Performs a downward trace at <paramref name="position"/> using a caller-supplied Z envelope.
+	/// Callers should resolve <paramref name="zMin"/> / <paramref name="zMax"/> once per generation
+	/// job (tile bounds already carry a bounded Z envelope of ±TileHeight = ±50000u) and reuse
+	/// them across every point — the per-point <c>scene.GetBounds()</c> path this replaces was the
+	/// dominant fill-time cost at high densities.
+	/// </summary>
+	protected static SceneTraceResult TraceGround( Scene scene, Vector3 position, float zMin, float zMax )
+	{
+		var traceStart = position.WithZ( zMax );
+		var traceEnd = position.WithZ( zMin );
+
+		ClutterGridSystem.s_pointsTraced++;
 
 		return scene.Trace
 			.Ray( traceStart, traceEnd )
 			.WithoutTags( "player", "trigger", "clutter" )
 			.Run();
+	}
+
+	/// <summary>
+	/// Resolves a job-scoped trace Z envelope from the caller's <paramref name="bounds"/>, falling
+	/// back to <c>scene.GetBounds()</c> only when <paramref name="bounds"/> has a degenerate Z
+	/// range. Call this ONCE at the start of a scatter job and thread the returned min/max through
+	/// the per-point trace calls — that's what removes the O(points) <c>scene.GetBounds()</c> walk.
+	/// </summary>
+	protected static (float ZMin, float ZMax) ResolveTraceZRange( Scene scene, BBox bounds )
+	{
+		var zMin = bounds.Mins.z;
+		var zMax = bounds.Maxs.z;
+
+		if ( zMax - zMin > 1.0f )
+			return (zMin, zMax);
+
+		var sceneBounds = scene.GetBounds();
+		return (sceneBounds.Mins.z, sceneBounds.Maxs.z);
 	}
 
 	/// <summary>

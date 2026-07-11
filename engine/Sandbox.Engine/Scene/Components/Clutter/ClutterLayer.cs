@@ -1,3 +1,9 @@
+// [PERF-OK: reconvergence patch for fork commit 8073facb "Fix clutter streaming frame spikes".
+//  Fork re-keyed _batches to (TileCoord, Model), producing up to R*R*M batches at Eden radius 8
+//  (289 tiles x 12 models = 3468 batches; ~470ms GPU frames + editor crash). Upstream stock keying
+//  is Dictionary<Model, ClutterBatchSceneObject>. This file restores stock keying while preserving
+//  the fork's per-tile bookkeeping and budgeted streaming, coalescing many dirty tiles into one
+//  SetInstances-per-model rebuild under the existing streaming deadline.]
 namespace Sandbox.Clutter;
 
 class ClutterLayer
@@ -15,19 +21,28 @@ class ClutterLayer
 
 	/// <summary>
 	/// Model instances organized by tile coordinate.
+	/// Per-tile bookkeeping stays here so budgeted streaming, tile invalidation and
+	/// out-of-range removal can operate at tile granularity.
 	/// </summary>
 	private Dictionary<Vector2Int, List<ClutterInstance>> ModelInstancesByTile { get; } = [];
 
 	/// <summary>
-	/// Batches organized by tile and model. Keeping streamed tiles separate avoids re-uploading
-	/// the entire model instance list when a single infinite tile changes.
+	/// Batches organized by model (one merged <see cref="ClutterBatchSceneObject"/> per model per layer,
+	/// matching stock keying). At Eden radius 8 this is ~12 batches instead of ~3.4k, so each frame's
+	/// command-list replay is bounded by model count rather than tile count.
 	/// </summary>
-	private readonly Dictionary<(Vector2Int TileCoord, Model Model), ClutterBatchSceneObject> _batches = [];
+	private readonly Dictionary<Model, ClutterBatchSceneObject> _batches = [];
 
-	private readonly HashSet<Vector2Int> _dirtyTiles = [];
-	private readonly Dictionary<Model, List<Transform>> _transformsByModelScratch = [];
-	private readonly HashSet<Model> _activeModelsScratch = [];
-	private readonly List<(Vector2Int TileCoord, Model Model)> _staleBatchKeys = [];
+	/// <summary>
+	/// Models whose merged batch needs re-upload. Tile churn coalesces here so many dirty tiles
+	/// collapse into ONE <see cref="ClutterBatchSceneObject.SetInstances"/> call per model per
+	/// <see cref="RebuildBatches"/>, and the streaming deadline throttles that to
+	/// <see cref="MaxDirtyModelsPerRebuild"/> models per frame.
+	/// </summary>
+	private readonly HashSet<Model> _dirtyModels = [];
+
+	private readonly List<Transform> _transformScratch = [];
+	private readonly List<Model> _rebuildScratch = [];
 
 	private readonly HashSet<Vector2Int> _activeCoords = [];
 	private readonly List<Vector2Int> _coordsToRemove = [];
@@ -42,7 +57,14 @@ class ClutterLayer
 
 	private int _lastSettingsHash;
 	private const float TileHeight = 50000f;
-	private const int MaxDirtyTilesPerRebuild = 4;
+
+	/// <summary>
+	/// Upper bound on how many model-batches this layer will re-upload in one
+	/// <see cref="RebuildBatches"/> pass. Bounds the per-frame CPU cost of merged-batch rebuilds
+	/// under the streaming deadline; leftover dirty models roll into the next frame.
+	/// </summary>
+	private const int MaxDirtyModelsPerRebuild = 2;
+
 	private bool _dirty = false;
 
 	public bool IsDirty => _dirty;
@@ -150,12 +172,20 @@ class ClutterLayer
 
 	/// <summary>
 	/// Clears model instances and collision bodies for a specific tile coordinate.
+	/// Marks every model that had instances in this tile as dirty so its merged batch is rebuilt.
 	/// </summary>
 	public void ClearTileModelInstances( Vector2Int tileCoord )
 	{
-		if ( ModelInstancesByTile.Remove( tileCoord ) )
+		if ( ModelInstancesByTile.TryGetValue( tileCoord, out var instances ) )
 		{
-			_dirtyTiles.Add( tileCoord );
+			foreach ( var instance in instances )
+			{
+				var model = instance.Entry?.Model;
+				if ( model != null )
+					_dirtyModels.Add( model );
+			}
+
+			ModelInstancesByTile.Remove( tileCoord );
 			_dirty = true;
 		}
 
@@ -177,7 +207,7 @@ class ClutterLayer
 
 		instances.Add( instance );
 
-		_dirtyTiles.Add( tileCoord );
+		_dirtyModels.Add( instance.Entry.Model );
 		_dirty = true;
 
 		TryCreateBody( tileCoord, instance );
@@ -209,7 +239,8 @@ class ClutterLayer
 			}
 		}
 
-		RebuildBatches();
+		// Painted layers rebuild everything up front, no streaming coalesce needed.
+		RebuildAllDirtyModels();
 	}
 
 	/// <summary>
@@ -250,74 +281,92 @@ class ClutterLayer
 			if ( body.IsValid() ) body.Remove();
 	}
 
+	/// <summary>
+	/// Rebuilds up to <see cref="MaxDirtyModelsPerRebuild"/> merged batches per call. Each rebuild
+	/// walks all live tiles once, gathers the target model's transforms into a scratch list, and
+	/// performs a single <see cref="ClutterBatchSceneObject.SetInstances"/> upload. Many dirty tiles
+	/// on the same model collapse into one command-list rebuild here — that's the coalescing win
+	/// that replaces the fork's per-tile batches without re-introducing the 07-03 frame spike.
+	/// </summary>
 	public void RebuildBatches()
 	{
 		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
 		if ( scene?.SceneWorld == null ) { _dirty = false; return; }
 
-		var rebuiltTiles = 0;
-		foreach ( var tileCoord in _dirtyTiles.ToArray() )
+		if ( _dirtyModels.Count == 0 )
 		{
-			RebuildTileBatches( scene, tileCoord );
-			_dirtyTiles.Remove( tileCoord );
+			_dirty = false;
+			return;
+		}
 
-			rebuiltTiles++;
-			if ( rebuiltTiles >= MaxDirtyTilesPerRebuild )
+		_rebuildScratch.Clear();
+		var budget = 0;
+		foreach ( var model in _dirtyModels )
+		{
+			_rebuildScratch.Add( model );
+			if ( ++budget >= MaxDirtyModelsPerRebuild )
 				break;
 		}
 
-		_dirty = _dirtyTiles.Count > 0;
+		foreach ( var model in _rebuildScratch )
+		{
+			RebuildModelBatch( scene, model );
+			_dirtyModels.Remove( model );
+		}
+
+		_dirty = _dirtyModels.Count > 0;
 	}
 
-	private void RebuildTileBatches( Scene scene, Vector2Int tileCoord )
+	private void RebuildAllDirtyModels()
 	{
-		_transformsByModelScratch.Clear();
-		_activeModelsScratch.Clear();
+		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
+		if ( scene?.SceneWorld == null ) { _dirtyModels.Clear(); _dirty = false; return; }
 
-		if ( ModelInstancesByTile.TryGetValue( tileCoord, out var instances ) )
+		_rebuildScratch.Clear();
+		foreach ( var model in _dirtyModels )
+			_rebuildScratch.Add( model );
+
+		foreach ( var model in _rebuildScratch )
+			RebuildModelBatch( scene, model );
+
+		_dirtyModels.Clear();
+		_dirty = false;
+	}
+
+	private void RebuildModelBatch( Scene scene, Model model )
+	{
+		if ( model == null )
+			return;
+
+		_transformScratch.Clear();
+
+		foreach ( var (_, instances) in ModelInstancesByTile )
 		{
 			foreach ( var instance in instances )
 			{
-				var model = instance.Entry?.Model;
-				if ( model == null )
-					continue;
-
-				_activeModelsScratch.Add( model );
-
-				if ( !_transformsByModelScratch.TryGetValue( model, out var transforms ) )
-				{
-					transforms = [];
-					_transformsByModelScratch[model] = transforms;
-				}
-
-				transforms.Add( instance.Transform );
+				if ( ReferenceEquals( instance.Entry?.Model, model ) )
+					_transformScratch.Add( instance.Transform );
 			}
 		}
 
-		foreach ( var (model, transforms) in _transformsByModelScratch )
+		if ( _transformScratch.Count == 0 )
 		{
-			var key = (tileCoord, model);
-			if ( !_batches.TryGetValue( key, out var batch ) )
-			{
-				batch = new ClutterBatchSceneObject( scene.SceneWorld, model );
-				_batches[key] = batch;
-			}
-
-			batch.SetInstances( transforms );
+			// Model has no live tiles left (radius shrink or full clear) — drop the batch so
+			// the merged draw stops replaying stale instances.
+			if ( _batches.Remove( model, out var toDelete ) )
+				toDelete.Delete();
+			return;
 		}
 
-		_staleBatchKeys.Clear();
-		foreach ( var key in _batches.Keys )
+		if ( !_batches.TryGetValue( model, out var batch ) )
 		{
-			if ( key.TileCoord == tileCoord && !_activeModelsScratch.Contains( key.Model ) )
-				_staleBatchKeys.Add( key );
+			batch = new ClutterBatchSceneObject( scene.SceneWorld, model );
+			_batches[model] = batch;
 		}
 
-		foreach ( var key in _staleBatchKeys )
-		{
-			_batches[key].Delete();
-			_batches.Remove( key );
-		}
+		// [PERF-OK: counter for clutter_stats — reconvergence patch T5]
+		batch.SetInstances( _transformScratch );
+		ClutterGridSystem.s_batchRebuilds++;
 	}
 
 	public void ClearAllTiles()
@@ -338,7 +387,7 @@ class ClutterLayer
 			batch.Delete();
 
 		_batches.Clear();
-		_dirtyTiles.Clear();
+		_dirtyModels.Clear();
 		_dirty = false;
 	}
 
@@ -388,4 +437,22 @@ class ClutterLayer
 		new Vector3( coord.x * Settings.Clutter.TileSize, coord.y * Settings.Clutter.TileSize, -TileHeight ),
 		new Vector3( (coord.x + 1) * Settings.Clutter.TileSize, (coord.y + 1) * Settings.Clutter.TileSize, TileHeight )
 	);
+
+	// -----------------------------------------------------------------------------------
+	// Diagnostics — cheap snapshots for the clutter_stats ConCmd. No hot-path allocation.
+	// -----------------------------------------------------------------------------------
+
+	internal int BatchCount => _batches.Count;
+	internal int TileCount => Tiles.Count;
+	internal int PopulatedTileCount
+	{
+		get
+		{
+			int n = 0;
+			foreach ( var tile in Tiles.Values )
+				if ( tile.IsPopulated ) n++;
+			return n;
+		}
+	}
+	internal int DirtyModelCount => _dirtyModels.Count;
 }

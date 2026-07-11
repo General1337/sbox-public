@@ -183,6 +183,7 @@ class ClutterGenerationJob
 		{
 			Tile.IsPopulated = true;
 			Layer?.OnTilePopulated( Tile );
+			ClutterGridSystem.s_tilesCompleted++;
 		}
 
 		_completed = true;

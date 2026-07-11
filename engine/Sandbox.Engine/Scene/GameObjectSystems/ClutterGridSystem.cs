@@ -17,8 +17,20 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 	private const int MAX_PENDING_JOBS = 100;
 	private const float MIN_STREAMING_BUDGET_MS = 0.1f;
 
+	// Camera-move threshold that forces a pending-job resort. Below this, the count-delta trigger
+	// carries — above it (~5m XY), the "nearest 100" nearest-first invariant would otherwise be
+	// stale so we resort. Chosen to be smaller than the smallest supported TileSize (default 512u).
+	private const float SORT_CAMERA_MOVE_SQR = 200f * 200f;
+
 	[ConVar( "clutter_stream_budget_ms", ConVarFlags.Cheat )]
 	internal static float StreamingBudgetMs { get; set; } = 1.5f;
+
+	// Cheap disk-observable counters for the clutter_stats ConCmd. Plain longs, incremented on the
+	// main thread only (clutter streaming is main-thread today) — no Interlocked overhead, no boxing.
+	internal static long s_pointsTraced;
+	internal static long s_tilesCompleted;
+	internal static long s_jobsTrimmed;
+	internal static long s_batchRebuilds;
 
 	private readonly List<ClutterGenerationJob> _pendingJobs = [];
 	private readonly HashSet<ClutterTile> _pendingTiles = [];
@@ -295,6 +307,7 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 	}
 
 	private int _lastSortedJobCount = 0;
+	private Vector3 _lastSortCameraPosition;
 
 	private void ProcessJobs()
 	{
@@ -313,21 +326,32 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 			job.Tile?.IsPopulated == true
 		);
 
-		// Only sort when job count changes significantly (avoid sorting every frame)
-		if ( Math.Abs( _pendingJobs.Count - _lastSortedJobCount ) > 50 || _lastSortedJobCount == 0 )
+		// Sort triggers:
+		//  1. Cold start (_lastSortedJobCount == 0).
+		//  2. Job count moved substantially (the existing count-delta heuristic).
+		//  3. Camera moved far enough that "nearest 100" is meaningfully stale — without this
+		//     the trim below would keep a stale far-first set as the player walked away from the
+		//     original center, delaying arrival of the nearest tiles.
+		var cameraMovedSqr = _lastSortCameraPosition.DistanceSquared( _lastCameraPosition );
+		var cameraMovedFar = cameraMovedSqr > SORT_CAMERA_MOVE_SQR;
+		if ( _lastSortedJobCount == 0 || Math.Abs( _pendingJobs.Count - _lastSortedJobCount ) > 50 || cameraMovedFar )
 		{
+			var cam = _lastCameraPosition;
 			_pendingJobs.Sort( ( a, b ) =>
 			{
-				// Use tile bounds for infinite mode, job bounds for volume mode
+				// Use tile bounds for infinite mode, job bounds for volume mode.
+				// DistanceSquared: sort by squared distance to skip a per-compare sqrt without
+				// changing the resulting ordering.
 				var distA = a.Tile != null
-					? a.Tile.Bounds.Center.Distance( _lastCameraPosition )
-					: a.Bounds.Center.Distance( _lastCameraPosition );
+					? a.Tile.Bounds.Center.DistanceSquared( cam )
+					: a.Bounds.Center.DistanceSquared( cam );
 				var distB = b.Tile != null
-					? b.Tile.Bounds.Center.Distance( _lastCameraPosition )
-					: b.Bounds.Center.Distance( _lastCameraPosition );
+					? b.Tile.Bounds.Center.DistanceSquared( cam )
+					: b.Bounds.Center.DistanceSquared( cam );
 				return distA.CompareTo( distB );
 			} );
 			_lastSortedJobCount = _pendingJobs.Count;
+			_lastSortCameraPosition = _lastCameraPosition;
 		}
 
 		// Process nearest tiles first
@@ -404,18 +428,35 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 		}
 	}
 
+	/// <summary>
+	/// Trims infinite-mode pending jobs beyond <see cref="MAX_PENDING_JOBS"/>. Because the list was
+	/// just sorted nearest-first (see ProcessJobs), the kept jobs are the nearest N infinite jobs
+	/// plus all volume jobs. Single-pass, allocation-free — the prior implementation allocated two
+	/// LINQ lists every frame (~50 tile churn budget * 60fps = ~3k allocations/sec).
+	/// </summary>
 	private void TrimPendingJobs()
 	{
-		var infiniteJobs = _pendingJobs.Where( j => j.Tile != null ).ToList();
-		if ( infiniteJobs.Count > MAX_PENDING_JOBS )
+		int infiniteKept = 0;
+		int trimmedThisFrame = 0;
+
+		_pendingJobs.RemoveAll( job =>
 		{
-			var toRemove = infiniteJobs.Skip( MAX_PENDING_JOBS ).ToList();
-			foreach ( var job in toRemove )
+			if ( job.Tile == null )
+				return false; // Never trim volume jobs.
+
+			if ( infiniteKept < MAX_PENDING_JOBS )
 			{
-				_pendingTiles.Remove( job.Tile );
-				_pendingJobs.Remove( job );
+				infiniteKept++;
+				return false;
 			}
-		}
+
+			_pendingTiles.Remove( job.Tile );
+			trimmedThisFrame++;
+			return true;
+		} );
+
+		if ( trimmedThisFrame > 0 )
+			s_jobsTrimmed += trimmedThisFrame;
 	}
 
 	/// <summary>
@@ -488,6 +529,81 @@ public sealed partial class ClutterGridSystem : GameObjectSystem
 	{
 		RebuildPaintedLayer();
 		_dirty = false;
+	}
+
+	// [PERF-OK: reconvergence patch for fork commit 8073facb — restores stock per-model batch keying;
+	//  clutter_stats observability closes the diagnostic gap that let the regression ship.]
+	/// <summary>
+	/// Console command: one-line diagnostic snapshot for the clutter system. Prints the live batch
+	/// count (the metric the fork-8073facb regression exploded), pending / trimmed / traced counters,
+	/// and per-infinite-layer populated/total tile ring status. Zero hot-path allocation.
+	/// </summary>
+	[ConCmd( "clutter_stats", ConVarFlags.Cheat )]
+	internal static void ConCmd_ClutterStats()
+	{
+		var scene = Game.ActiveScene;
+		if ( scene is null )
+		{
+			Log.Info( "clutter_stats: no active scene" );
+			return;
+		}
+
+		var system = scene.GetSystem<ClutterGridSystem>();
+		if ( system is null )
+		{
+			Log.Info( "clutter_stats: no ClutterGridSystem in scene" );
+			return;
+		}
+
+		system.DumpStats();
+	}
+
+	private void DumpStats()
+	{
+		int totalBatches = 0;
+		int totalDirtyModels = 0;
+		if ( _painted is not null )
+		{
+			totalBatches += _painted.BatchCount;
+			totalDirtyModels += _painted.DirtyModelCount;
+		}
+		foreach ( var layer in _componentToLayer.Values )
+		{
+			totalBatches += layer.BatchCount;
+			totalDirtyModels += layer.DirtyModelCount;
+		}
+
+		var line = new System.Text.StringBuilder( 256 );
+		line.Append( "clutter_stats" );
+		line.Append( " batches=" ).Append( totalBatches );
+		line.Append( " pending=" ).Append( _pendingJobs.Count );
+		line.Append( " pending_rebuild=" ).Append( _layersPendingRebuild.Count );
+		line.Append( " dirty_models=" ).Append( totalDirtyModels );
+		line.Append( " budget_ms=" ).Append( StreamingBudgetMs.ToString( "0.##" ) );
+		line.Append( " | points_traced=" ).Append( s_pointsTraced );
+		line.Append( " tiles_completed=" ).Append( s_tilesCompleted );
+		line.Append( " jobs_trimmed=" ).Append( s_jobsTrimmed );
+		line.Append( " batch_rebuilds=" ).Append( s_batchRebuilds );
+
+		var painted = _painted;
+		if ( painted is not null && painted.TileCount > 0 )
+		{
+			line.Append( " | painted[" );
+			line.Append( painted.PopulatedTileCount ).Append( '/' ).Append( painted.TileCount );
+			line.Append( "]" );
+		}
+
+		foreach ( var (component, layer) in _componentToLayer )
+		{
+			if ( !component.IsValid() || !component.Infinite ) continue;
+			line.Append( " | " );
+			line.Append( component.GameObject?.Name ?? "?" );
+			line.Append( '[' );
+			line.Append( layer.PopulatedTileCount ).Append( '/' ).Append( layer.TileCount );
+			line.Append( ']' );
+		}
+
+		Log.Info( line.ToString() );
 	}
 
 	/// <summary>
