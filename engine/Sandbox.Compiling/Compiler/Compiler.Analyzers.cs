@@ -224,6 +224,32 @@ partial class Compiler
 	// [HANDOFF-TRUST: probe instrumentation to diagnose why FrameBasisAnalyzer loads via reflection.list_assemblies type_count=1 but produces 0 of 170 warnings; not a code change driven by any inherited H1 hypothesis]
 	private void RunProjectAnalyzers( CSharpCompilation compilation, CompilerOutput output )
 	{
+		// FORK-PATCH (Sandbox++ — analyzer opt-in gate).
+		//
+		// MEASURED 2026-07-24 (six samples, one editor session): this pass costs
+		// 4.5-8.5s per main-assembly compile (1,653 trees), and returns ZERO
+		// diagnostics on every compile after the first of each boot. Gating it out
+		// removed the entire window (PROBE discovered_analyzers=0 -> no analyzer
+		// pass at all) with no other measured effect.
+		//
+		// The post-first-compile silence is NOT the duplicate-type issue described
+		// in sandbox-plus-plus/docs/ai/plans/gh-fba001-rollout.md:167 — that theory
+		// was falsified 2026-07-24 by excluding FrameBasisAnalyzer.cs from
+		// arenula_mcp.editor (trees 114 -> 113) and observing the silence unchanged.
+		// Root cause remains unknown.
+		//
+		// Default OFF. Opt in by creating <project-root>/.analyzers-on — no editor
+		// restart needed, because DiscoverProjectAnalyzers re-runs the filesystem
+		// scan on every build. Intended workflow: enable -> cold boot -> take the
+		// frame audit from the first compile -> disable.
+		var gateRoot = ResolveActiveProjectRoot();
+		if ( gateRoot is null ||
+		     !System.IO.File.Exists( System.IO.Path.Combine( gateRoot, ".analyzers-on" ) ) )
+		{
+			Log.Info( $"[Compiler.Analyzers] PROBE analyzers_gated_off compiler={Name}" );
+			return;
+		}
+
 		var analyzers = DiscoverProjectAnalyzers();
 		Log.Info( $"[Compiler.Analyzers] PROBE compiler={Name} discovered_analyzers={analyzers.Length} trees={compilation.SyntaxTrees.Length}" );
 		if ( analyzers.IsEmpty ) return;
