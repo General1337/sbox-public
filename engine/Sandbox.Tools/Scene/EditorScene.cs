@@ -252,9 +252,12 @@ public static class EditorScene
 
 		if ( playMode )
 		{
-			LoadingScreen.IsVisible = true;
-			LoadingScreen.Title = "Loading Game..";
-			IGameInstanceDll.Current.EditorPlay();
+			if ( IGameInstance.Current is not null )
+			{
+				LoadingScreen.IsVisible = true;
+				LoadingScreen.Title = "Loading Game..";
+				IGameInstanceDll.Current.EditorPlay();
+			}
 		}
 		else
 		{
@@ -292,7 +295,6 @@ public static class EditorScene
 		}
 
 		SceneEditorSession.Active.SetPlaying( Game.ActiveScene );
-
 		EditorEvent.Run( "scene.play" );
 	}
 
@@ -303,7 +305,7 @@ public static class EditorScene
 
 		Game.IsClosing = true;
 
-		SceneEditorSession.Active.StopPlaying();
+		SceneEditorSession.Playing?.StopPlaying();
 
 		Game.IsPlaying = false;
 		Game.IsPaused = false;
@@ -389,10 +391,6 @@ public static class EditorScene
 		ArgumentNullException.ThrowIfNull( prefab );
 
 		var allSessions = SceneEditorSession.All;
-
-		// If only the edited prefab session is open, there's nothing else to update
-		if ( allSessions.Count <= 1 )
-			return;
 
 		// First pass: update other open prefab sessions that may contain instances
 		// of this prefab, then write their changes so dependent prefabs stay current

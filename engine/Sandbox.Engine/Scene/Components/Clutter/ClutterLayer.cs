@@ -26,23 +26,34 @@ class ClutterLayer
 	/// </summary>
 	private Dictionary<Vector2Int, List<ClutterInstance>> ModelInstancesByTile { get; } = [];
 
+	// [PERF-OK: 2026-07-25 upstream-merge conflict resolution — field re-key only, no new optimization; see this file's header + docs/ai/plans/2026-07-25-engine-fork-upstream-sync.md]
 	/// <summary>
-	/// Batches organized by model (one merged <see cref="ClutterBatchSceneObject"/> per model per layer,
-	/// matching stock keying). At Eden radius 8 this is ~12 batches instead of ~3.4k, so each frame's
-	/// command-list replay is bounded by model count rather than tile count.
+	/// Batch identity. Upstream (3c3435fd) widened this from bare <see cref="Model"/> to
+	/// (model, castShadows) so shadow-casting and non-casting instances of the same model get
+	/// separate merged batches. Still bounded by model count, so it does NOT reintroduce the
+	/// per-(tile, model) blow-up this file's header describes: at Eden radius 8 that is ~12–24
+	/// batches, not ~3.4k, and each frame's command-list replay stays bounded by model count
+	/// rather than tile count.
 	/// </summary>
-	private readonly Dictionary<Model, ClutterBatchSceneObject> _batches = [];
+	private readonly record struct ClutterBatchKey( Model Model, bool CastShadows );
+
+	private static ClutterBatchKey KeyFor( ClutterEntry entry ) => new( entry.Model, entry.CastShadows );
 
 	/// <summary>
-	/// Models whose merged batch needs re-upload. Tile churn coalesces here so many dirty tiles
-	/// collapse into ONE <see cref="ClutterBatchSceneObject.SetInstances"/> call per model per
-	/// <see cref="RebuildBatches"/>, and the streaming deadline throttles that to
-	/// <see cref="MaxDirtyModelsPerRebuild"/> models per frame.
+	/// One merged <see cref="ClutterBatchSceneObject"/> per key per layer.
 	/// </summary>
-	private readonly HashSet<Model> _dirtyModels = [];
+	private readonly Dictionary<ClutterBatchKey, ClutterBatchSceneObject> _batches = [];
+
+	/// <summary>
+	/// Batch keys whose merged batch needs re-upload. Tile churn coalesces here so many dirty tiles
+	/// collapse into ONE <see cref="ClutterBatchSceneObject.SetInstances"/> call per key per
+	/// <see cref="RebuildBatches"/>, and the streaming deadline throttles that to
+	/// <see cref="MaxDirtyModelsPerRebuild"/> keys per frame.
+	/// </summary>
+	private readonly HashSet<ClutterBatchKey> _dirtyModels = [];
 
 	private readonly List<Transform> _transformScratch = [];
-	private readonly List<Model> _rebuildScratch = [];
+	private readonly List<ClutterBatchKey> _rebuildScratch = [];
 
 	private readonly HashSet<Vector2Int> _activeCoords = [];
 	private readonly List<Vector2Int> _coordsToRemove = [];
@@ -180,9 +191,8 @@ class ClutterLayer
 		{
 			foreach ( var instance in instances )
 			{
-				var model = instance.Entry?.Model;
-				if ( model != null )
-					_dirtyModels.Add( model );
+				if ( instance.Entry?.Model != null )
+					_dirtyModels.Add( KeyFor( instance.Entry ) );
 			}
 
 			ModelInstancesByTile.Remove( tileCoord );
@@ -207,7 +217,7 @@ class ClutterLayer
 
 		instances.Add( instance );
 
-		_dirtyModels.Add( instance.Entry.Model );
+		_dirtyModels.Add( KeyFor( instance.Entry ) );
 		_dirty = true;
 
 		TryCreateBody( tileCoord, instance );
@@ -252,6 +262,9 @@ class ClutterLayer
 		if ( model?.Physics?.Parts.Count is not > 0 )
 			return;
 
+		if ( instance.Entry?.EnablePhysics is false )
+			return;
+
 		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
 		if ( scene == null )
 			return;
@@ -290,6 +303,9 @@ class ClutterLayer
 	/// </summary>
 	public void RebuildBatches()
 	{
+		// Don't build batch list on headless. We only care about collisions.
+		if ( Application.IsHeadless ) { _dirty = false; return; }
+
 		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
 		if ( scene?.SceneWorld == null ) { _dirty = false; return; }
 
@@ -301,41 +317,48 @@ class ClutterLayer
 
 		_rebuildScratch.Clear();
 		var budget = 0;
-		foreach ( var model in _dirtyModels )
+		foreach ( var key in _dirtyModels )
 		{
-			_rebuildScratch.Add( model );
+			_rebuildScratch.Add( key );
 			if ( ++budget >= MaxDirtyModelsPerRebuild )
 				break;
 		}
 
-		foreach ( var model in _rebuildScratch )
+		foreach ( var key in _rebuildScratch )
 		{
-			RebuildModelBatch( scene, model );
-			_dirtyModels.Remove( model );
+			RebuildModelBatch( scene, key );
+			_dirtyModels.Remove( key );
 		}
 
 		_dirty = _dirtyModels.Count > 0;
 	}
 
+	// [PERF-OK: 2026-07-25 upstream-merge conflict resolution — unbudgeted flush path preserved from this file's existing coalescing patch, re-keyed to ClutterBatchKey]
 	private void RebuildAllDirtyModels()
 	{
+		// Same headless skip upstream (c7b89fee) added to RebuildBatches — only collision matters
+		// there. This flush path has to honour it too, or the painted/volume route would keep
+		// building batch scene objects on a headless server.
+		if ( Application.IsHeadless ) { _dirtyModels.Clear(); _dirty = false; return; }
+
 		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
 		if ( scene?.SceneWorld == null ) { _dirtyModels.Clear(); _dirty = false; return; }
 
 		_rebuildScratch.Clear();
-		foreach ( var model in _dirtyModels )
-			_rebuildScratch.Add( model );
+		foreach ( var key in _dirtyModels )
+			_rebuildScratch.Add( key );
 
-		foreach ( var model in _rebuildScratch )
-			RebuildModelBatch( scene, model );
+		foreach ( var key in _rebuildScratch )
+			RebuildModelBatch( scene, key );
 
 		_dirtyModels.Clear();
 		_dirty = false;
 	}
 
-	private void RebuildModelBatch( Scene scene, Model model )
+	// [PERF-OK: 2026-07-25 upstream-merge conflict resolution, not new optimization — keeps this file's existing coalescing patch (see header) and only re-keys it from Model to upstream's ClutterBatchKey(Model, CastShadows) per docs/ai/plans/2026-07-25-engine-fork-upstream-sync.md]
+	private void RebuildModelBatch( Scene scene, ClutterBatchKey key )
 	{
-		if ( model == null )
+		if ( key.Model == null )
 			return;
 
 		_transformScratch.Clear();
@@ -344,24 +367,26 @@ class ClutterLayer
 		{
 			foreach ( var instance in instances )
 			{
-				if ( ReferenceEquals( instance.Entry?.Model, model ) )
+				if ( instance.Entry?.Model != null && KeyFor( instance.Entry ) == key )
 					_transformScratch.Add( instance.Transform );
 			}
 		}
 
 		if ( _transformScratch.Count == 0 )
 		{
-			// Model has no live tiles left (radius shrink or full clear) — drop the batch so
+			// Key has no live tiles left (radius shrink or full clear) — drop the batch so
 			// the merged draw stops replaying stale instances.
-			if ( _batches.Remove( model, out var toDelete ) )
+			if ( _batches.Remove( key, out var toDelete ) )
 				toDelete.Delete();
 			return;
 		}
 
-		if ( !_batches.TryGetValue( model, out var batch ) )
+		if ( !_batches.TryGetValue( key, out var batch ) )
 		{
-			batch = new ClutterBatchSceneObject( scene.SceneWorld, model );
-			_batches[model] = batch;
+			// castShadows rides the key (upstream 3c3435fd) so shadow-casting and
+			// non-casting instances of the same model never share a merged batch.
+			batch = new ClutterBatchSceneObject( scene.SceneWorld, key.Model, key.CastShadows );
+			_batches[key] = batch;
 		}
 
 		// [PERF-OK: counter for clutter_stats — reconvergence patch T5]

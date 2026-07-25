@@ -150,31 +150,17 @@ public abstract class Scatterer
 	/// <summary>
 	/// Helper to perform a ground trace at a position.
 	/// <para>
-	/// Prefer the (scene, position, zMin, zMax) overload from a scatterer's inner loop:
-	/// <c>scene.GetBounds()</c> walks every <c>IHasBounds</c> component in the scene, so calling it
-	/// per point is pathological in solar-system-scale scenes (ClutterGridSystem.ProcessJobs
-	/// invokes this thousands of times per streaming tile). Hoist the trace Z range once per
-	/// generation job / streaming work item and pass it in.
+	/// <paramref name="sceneBounds"/> supplies the trace Z envelope and must be resolved ONCE per
+	/// generation job via <see cref="ResolveTraceBounds"/> — never per point. <c>scene.GetBounds()</c>
+	/// walks every <c>IHasBounds</c> component in the scene, so calling it per point is pathological
+	/// in solar-system-scale scenes (ClutterGridSystem.ProcessJobs invokes this thousands of times
+	/// per streaming tile).
 	/// </para>
 	/// </summary>
-	protected static SceneTraceResult TraceGround( Scene scene, Vector3 position )
+	protected static SceneTraceResult TraceGround( Scene scene, Vector3 position, BBox sceneBounds )
 	{
-		// Use scene bounds to determine trace extent
-		var sceneBounds = scene.GetBounds();
-		return TraceGround( scene, position, sceneBounds.Mins.z, sceneBounds.Maxs.z );
-	}
-
-	/// <summary>
-	/// Performs a downward trace at <paramref name="position"/> using a caller-supplied Z envelope.
-	/// Callers should resolve <paramref name="zMin"/> / <paramref name="zMax"/> once per generation
-	/// job (tile bounds already carry a bounded Z envelope of ±TileHeight = ±50000u) and reuse
-	/// them across every point — the per-point <c>scene.GetBounds()</c> path this replaces was the
-	/// dominant fill-time cost at high densities.
-	/// </summary>
-	protected static SceneTraceResult TraceGround( Scene scene, Vector3 position, float zMin, float zMax )
-	{
-		var traceStart = position.WithZ( zMax );
-		var traceEnd = position.WithZ( zMin );
+		var traceStart = position.WithZ( sceneBounds.Maxs.z );
+		var traceEnd = position.WithZ( sceneBounds.Mins.z );
 
 		ClutterGridSystem.s_pointsTraced++;
 
@@ -185,21 +171,53 @@ public abstract class Scatterer
 	}
 
 	/// <summary>
-	/// Resolves a job-scoped trace Z envelope from the caller's <paramref name="bounds"/>, falling
-	/// back to <c>scene.GetBounds()</c> only when <paramref name="bounds"/> has a degenerate Z
-	/// range. Call this ONCE at the start of a scatter job and thread the returned min/max through
-	/// the per-point trace calls — that's what removes the O(points) <c>scene.GetBounds()</c> walk.
+	/// Traces the ground at multiple positions at once.
 	/// </summary>
-	protected static (float ZMin, float ZMax) ResolveTraceZRange( Scene scene, BBox bounds )
+	protected static SceneTraceResult[] BatchTraceGround( Scene scene, IReadOnlyList<Vector3> positions, BBox sceneBounds )
 	{
-		var zMin = bounds.Mins.z;
-		var zMax = bounds.Maxs.z;
+		var results = new SceneTraceResult[positions.Count];
+		var physicsWorld = scene.PhysicsWorld;
 
-		if ( zMax - zMin > 1.0f )
-			return (zMin, zMax);
+		// Counted once here rather than inside the loop below — incrementing a shared static from
+		// inside Parallel.For would be a data race.
+		ClutterGridSystem.s_pointsTraced += positions.Count;
 
-		var sceneBounds = scene.GetBounds();
-		return (sceneBounds.Mins.z, sceneBounds.Maxs.z);
+		// even though this is on the main thread, it's safe to do since nothing will change 
+		// the physics world between now and when this completes
+		Parallel.For( 0, positions.Count, i =>
+		{
+			var position = positions[i];
+			var traceStart = position.WithZ( sceneBounds.Maxs.z );
+			var traceEnd = position.WithZ( sceneBounds.Mins.z );
+
+			var physicsResult = physicsWorld.Trace
+				.Ray( traceStart, traceEnd )
+				.WithoutTags( "player", "trigger", "clutter" )
+				.Run();
+
+			results[i] = SceneTraceResult.From( scene, physicsResult );
+		} );
+
+		return results;
+	}
+
+	/// <summary>
+	/// Resolves a job-scoped trace envelope from the caller's <paramref name="bounds"/>, falling back
+	/// to <c>scene.GetBounds()</c> only when <paramref name="bounds"/> has a degenerate Z range. Call
+	/// this ONCE at the start of a scatter job and thread the result through every per-point
+	/// <see cref="TraceGround"/> / <see cref="BatchTraceGround"/> call — that is what removes the
+	/// O(points) <c>scene.GetBounds()</c> walk.
+	/// <para>
+	/// The degenerate-Z guard is load-bearing: a tile whose bounds are flat in Z would otherwise
+	/// trace from a point to itself, hit nothing, and silently place no clutter.
+	/// </para>
+	/// </summary>
+	protected static BBox ResolveTraceBounds( Scene scene, BBox bounds )
+	{
+		if ( bounds.Maxs.z - bounds.Mins.z > 1.0f )
+			return bounds;
+
+		return scene.GetBounds();
 	}
 
 	/// <summary>
@@ -212,6 +230,53 @@ public abstract class Scatterer
 		seed = (seed * 397) ^ x;
 		seed = (seed * 397) ^ y;
 		return seed;
+	}
+
+	/// <summary>
+	/// Grid dimensions for roughly pointCount jittered points across bounds. Use JitteredGridPoints
+	/// unless you need the raw cell counts.
+	/// </summary>
+	protected static void GetJitteredGridSize( BBox bounds, int pointCount, out int cellsX, out int cellsY )
+	{
+		if ( pointCount <= 0 )
+		{
+			cellsX = 0;
+			cellsY = 0;
+			return;
+		}
+
+		var aspect = MathF.Max( bounds.Size.x, 0.0001f ) / MathF.Max( bounds.Size.y, 0.0001f );
+		cellsY = Math.Max( 1, (int)MathF.Round( MathF.Sqrt( pointCount / aspect ) ) );
+		cellsX = Math.Max( 1, (int)MathF.Round( pointCount / (float)cellsY ) );
+	}
+
+	/// <summary>
+	/// One jittered point per grid cell across bounds, roughly pointCount total. Even coverage,
+	/// no clumping or gaps. Z is always 0.
+	/// </summary>
+	protected Vector3[] JitteredGridPoints( BBox bounds, int pointCount )
+	{
+		GetJitteredGridSize( bounds, pointCount, out int cellsX, out int cellsY );
+		if ( cellsX <= 0 || cellsY <= 0 )
+			return [];
+
+		var cellWidth = bounds.Size.x / cellsX;
+		var cellHeight = bounds.Size.y / cellsY;
+
+		var points = new Vector3[cellsX * cellsY];
+		var index = 0;
+
+		for ( int cy = 0; cy < cellsY; cy++ )
+			for ( int cx = 0; cx < cellsX; cx++ )
+			{
+				points[index++] = new Vector3(
+					bounds.Mins.x + cx * cellWidth + Random.Float( cellWidth ),
+					bounds.Mins.y + cy * cellHeight + Random.Float( cellHeight ),
+					0f
+				);
+			}
+
+		return points;
 	}
 
 	/// <summary>
