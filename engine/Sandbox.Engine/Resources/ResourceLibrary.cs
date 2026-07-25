@@ -80,6 +80,47 @@ public class ResourceSystem
 	internal void OnHotload()
 	{
 		TypeCache.Clear();
+
+		// Project-defined GameResource types get a new CLR identity after a full hotload.
+		// Strongly cached instances from the outgoing assembly still occupy their path,
+		// but typed lookups can no longer cast them to the incoming type. Rehydrate only
+		// those stale resources; clearing the entire resource system would unnecessarily
+		// invalidate models, materials, textures, and unrelated managed resources.
+		var staleResources = ResourceIndex.Values
+			.OfType<GameResource>()
+			.Distinct()
+			.Where( IsStaleGameResourceType )
+			.ToArray();
+
+		var refreshed = 0;
+		foreach ( var staleResource in staleResources )
+		{
+			var sourcePackage = staleResource.Package;
+			var replacement = LoadRawGameResource( staleResource.ResourcePath );
+			if ( replacement is null )
+			{
+				Log.Warning( $"Failed to refresh stale GameResource '{staleResource.ResourcePath}' after hotload" );
+				continue;
+			}
+
+			replacement.Package = sourcePackage;
+			refreshed++;
+		}
+
+		if ( refreshed > 0 )
+			Log.Info( $"Refreshed {refreshed} stale GameResource instance(s) after hotload" );
+	}
+
+	private bool IsStaleGameResourceType( GameResource resource )
+	{
+		if ( string.IsNullOrWhiteSpace( resource.ResourcePath ) )
+			return false;
+
+		var extension = System.IO.Path.GetExtension( resource.ResourcePath );
+		if ( !TryGetType( extension, out var currentType ) || currentType.TargetType is null )
+			return false;
+
+		return !resource.GetType().IsAssignableTo( currentType.TargetType );
 	}
 
 	/// <summary>
