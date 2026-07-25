@@ -155,15 +155,30 @@ Runtime (fresh cold boot, gen 0):
 
 **NOT certified — do not claim these:**
 - **Patch 3.3** — built and symbol-present, but its cure path was never induced. **Unproven.**
-- **Patch 1.6/2.4** — channel binds, but no asset-compile failure was induced, so the emit path is
-  unproven.
-- **Fast-hotload veto** — symbol present, not exercised.
-- **`sbep.test_bug_grass_arrival_streaming_fix` — overall VERDICT: FAIL (4 of 5 gates).** The
-  streaming fix itself passes (`arrival_fill_completes` green, `fillP95=50.7ms` vs a 150ms budget),
-  but post-fill steady state `postP95=50.9ms` fails a 25ms budget. **The delta is deliberately
-  unattributed:** the measured null (11.11ms mean) was taken offworld while the failing sample was
-  on the surface, GPU throttling was ruled out, and an unrelated frame-collapse investigation on
-  that same scene is still open. Resolution needs a same-position grass-on/grass-off A/B.
+  Kept deliberately (2026-07-25 user decision to ship the sync); certifying it needs a real stale-
+  `GameResource` / clone-rot scenario.
+- **Patch 1.6/2.4** — **bind-proven with one FAILED emit (downgraded 2026-07-25).** A malformed
+  `.vmat` produced a real asset-compile failure (captured by `asset_query get_compile_errors` at
+  `17:11:58`) and `feed.assets` emitted **nothing** (`buffer_size: 0`). A second attempt with an
+  un-compilable `.shader` was inconclusive — an unreferenced shader is not compiled on
+  `asset_manage reload`, so no failure was induced at all. This does not prove the patch is broken
+  (the `.vmat` parse path may never route through `OnAssetCompileFailed`), but **do not treat
+  `feed.assets` as a working failure alarm.** Next probe must break a shader the loaded scene
+  actually references, so the compile is forced.
+- **Fast-hotload veto** — symbol present, not exercised. Circumstantial only: the 2026-07-25
+  phase-3b compile added a new `[ConCmd]` **and** a new `Component` type, and both were live at
+  gen 3 with no editor restart — the outcome the veto exists to guarantee — but `feed.hotload` was
+  subscribed after the file-watcher build, so the event itself was not captured.
+- **`sbep.test_bug_grass_arrival_streaming_fix` — overall VERDICT: FAIL (4 of 5 gates), and it
+  stays FAIL. Attribution resolved 2026-07-25; shipping anyway by user decision.** The streaming
+  fix itself passes. The failing sub-metric is post-fill steady state against a 25ms budget. A
+  same-position A/B (`sbep.eden_grass_ab`, control drift 0.92ms) splits it: **scene floor 17.0ms
+  p95 + grass 14.3ms p95 = 31–33ms.** Neither half alone breaks the budget; the sum does, and grass
+  is the larger contributor to the overage. The 2026-07-10 baseline that passed was **at the same
+  r8/d4.5 config** with postP95 22.4/21.7ms (commit `f9b75f1d5` — the earlier "@ r4" note was
+  wrong), so a real ~10ms regression exists at an unchanged config. **It is NOT attributed to this
+  merge** — splitting it from two weeks of scene/content change would need a `presync-2026-07-25`
+  engine rebuild, which was declined. Treat the merge as neither cleared nor charged here.
 
 Full detail, method notes, and the remaining checklist:
 `sandbox-plus-plus/docs/ai/sessions/2026-07-25-engine-fork-upstream-sync/phase-03.md`.
