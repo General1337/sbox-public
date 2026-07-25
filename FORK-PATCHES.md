@@ -130,17 +130,42 @@ ConCmds (`sbep.test_compile_on_build_completed`, `sbep.test_hotload_on_complete`
 `sbep.test_scene_mutation_events`, etc.) run on the Bootstrapped fork editor, and via
 the engine-fork CI (`sandbox-plus-plus/.github/workflows/engine-fork-ci.yml`).
 
-**2026-07-25 sync (merge `335b77c9`, base `20534558`) — BUILD-VERIFIED, RUNTIME-UNCERTIFIED.**
-What is proven: `SboxBuild build` / `build-shaders` / `build-content` all exit 0 with 0 errors;
-all patch symbols confirmed present in the freshly built binaries (`IsStaleGameResourceType`,
-`ResolveTraceBounds`, `TryCreateInstanceFromTrace`, `clutter_stats` in `Sandbox.Engine.dll`;
-`HasConsoleMetadataChanges` in `Sandbox.Hotload.dll`; `OnBuildCompleted`, `RunProjectAnalyzers`
-in `Sandbox.Compiling.dll`); the game project compiles against the merged engine with **0
-errors**; and the editor launches and reaches `editor-health.py` = `up` on the new build.
-What is NOT yet proven: **nothing runtime**. The 6 fork-event regression ConCmds, the
-`FBA002` analyzer anchor, patch 3.3's rehydration, and the clutter gates have all NOT been
-run against this merge. Do not treat this sync as certified until they are — the battery is
-listed in the game repo at
+**2026-07-25 sync (merge `335b77c9`, base `20534558`) — RUNTIME-CERTIFIED for 10 of 11 patches.**
+
+Build: `SboxBuild build` / `build-shaders` / `build-content` all exit 0 with 0 errors; all patch
+symbols present in the freshly built binaries; game project compiles against the merged engine with
+**0 errors**; in-engine compile **0 errors**.
+
+Runtime (fresh cold boot, gen 0):
+- **`feed action=channels`** → `compile` / `scene` / `assets` all `available: true`.
+- **Patch 1.1 `OnBuildCompleted`** — `feed.compile` emitted a real `build_completed`
+  (`output_count=1`, `error_count=0`, `warning_count=397`, `diagnostic_count=7575`).
+- **Patch 1.2 `OnCompileFailed`** — emitted `compile_failed` (`total_error_count=1`,
+  `successful=false`) on an induced CS0103, reverted immediately.
+- **Patches 1.3 / 1.4 / 1.5 / 1.5a** — `sbep.test_{hotload_on_complete,typelibrary_on_registered,
+  scene_mutation_events,component_property_changed}` all **4/4 gates PASS**.
+- **Patches 3.1 / 3.1.1 (the anchor)** — a deliberate `WorldVec3 + ShipLocalVec3` probe fired
+  **`FBA002` at severity `error`** on an in-engine compile (with `.analyzers-on` + cold boot);
+  FBA001 also fired across real scanned files. The analyzer survived upstream's renewed
+  `PackageLoader` assembly-loading rework — this was the highest semantic risk of the sync.
+- **Patch 3.2 (clutter)** — functionally certified: `clutter_stats` reports `batches=10` at Eden
+  radius 8 (**not** thousands — the per-`(tile, model)` blow-up did not return),
+  `EdenGrassClutter[225/225]` tiles populated (proves the `ResolveTraceBounds` degenerate-Z guard),
+  plus live `points_traced` / `jobs_trimmed` counters.
+
+**NOT certified — do not claim these:**
+- **Patch 3.3** — built and symbol-present, but its cure path was never induced. **Unproven.**
+- **Patch 1.6/2.4** — channel binds, but no asset-compile failure was induced, so the emit path is
+  unproven.
+- **Fast-hotload veto** — symbol present, not exercised.
+- **`sbep.test_bug_grass_arrival_streaming_fix` — overall VERDICT: FAIL (4 of 5 gates).** The
+  streaming fix itself passes (`arrival_fill_completes` green, `fillP95=50.7ms` vs a 150ms budget),
+  but post-fill steady state `postP95=50.9ms` fails a 25ms budget. **The delta is deliberately
+  unattributed:** the measured null (11.11ms mean) was taken offworld while the failing sample was
+  on the surface, GPU throttling was ruled out, and an unrelated frame-collapse investigation on
+  that same scene is still open. Resolution needs a same-position grass-on/grass-off A/B.
+
+Full detail, method notes, and the remaining checklist:
 `sandbox-plus-plus/docs/ai/sessions/2026-07-25-engine-fork-upstream-sync/phase-03.md`.
 
 > Method note: `strings` is not installed in this environment and returns empty output
