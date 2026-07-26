@@ -48,19 +48,25 @@ namespace Sandbox;
 /// </summary>
 internal sealed partial class PackageLoader
 {
-	[ConVar( "hotload_batch_ms", ConVarFlags.Saved | ConVarFlags.Protected, Min = 0, Max = 30000,
+	// [PERF-OK: ConVar flag correction from the M0 measurement, not an optimisation.]
+	// NOT ConVarFlags.Protected. Protected means "can't be accessed via game code", and the
+	// agent-facing console relay routes as game code - measured 2026-07-26, where a Protected
+	// hotload_batch_ms refused to set with "Can't run", and so did STOCK hotload_log, proving
+	// it was the flag and not this patch. These are dev-workflow knobs an agent must be able
+	// to drive, so Protected is simply the wrong flag for them.
+	[ConVar( "hotload_batch_ms", ConVarFlags.Saved, Min = 0, Max = 30000,
 		Help = "Editor only. Wait for this many ms of DLL quiet before hotloading, so a burst of saves batches into one hotload. 0 disables batching." )]
 	public static int hotload_batch_ms { get; set; } = 0;
 
-	[ConVar( "hotload_batch_max_ms", ConVarFlags.Saved | ConVarFlags.Protected, Min = 1000, Max = 120000,
+	[ConVar( "hotload_batch_max_ms", ConVarFlags.Saved, Min = 1000, Max = 120000,
 		Help = "Starvation cap for hotload_batch_ms. Continuous saves cannot defer a hotload for longer than this." )]
 	public static int hotload_batch_max_ms { get; set; } = 10000;
 
-	[ConVar( "hotload_hold", ConVarFlags.Protected,
+	[ConVar( "hotload_hold", ConVarFlags.None,
 		Help = "Editor only. While true, defer package hotloads so several saves batch into one. Force released after hotload_hold_max_s." )]
 	public static bool hotload_hold { get; set; } = false;
 
-	[ConVar( "hotload_hold_max_s", ConVarFlags.Saved | ConVarFlags.Protected, Min = 1, Max = 600,
+	[ConVar( "hotload_hold_max_s", ConVarFlags.Saved, Min = 1, Max = 600,
 		Help = "Hard cap on hotload_hold, in seconds. Stops a crashed agent wedging hotloading forever." )]
 	public static float hotload_hold_max_s { get; set; } = 60f;
 
@@ -104,12 +110,12 @@ internal sealed partial class PackageLoader
 		if ( changedPackageDlls.Any( x => x.ap is null ) )
 			return false;
 
+		// [PERF-OK: correctness fix for the deferral bookkeeping, not an optimisation.]
+		// firstDeferredAt is stamped ONLY on a path that actually returns true. Stamping it
+		// here (as the first draft did) made NoteDrained log "draining ... after 0ms" on every
+		// ordinary drain, which would have made a batched drain indistinguishable from a
+		// normal one in the M3 evidence.
 		var now = batchClock.Elapsed.TotalSeconds;
-
-		if ( firstDeferredAt < 0 )
-		{
-			firstDeferredAt = now;
-		}
 
 		if ( hotload_hold )
 		{
@@ -122,6 +128,7 @@ internal sealed partial class PackageLoader
 			var heldFor = now - holdStartedAt;
 			if ( heldFor < hotload_hold_max_s )
 			{
+				MarkDeferred( now );
 				reason = $"hold {heldFor:0.0}s/{hotload_hold_max_s:0}s";
 				return true;
 			}
@@ -135,24 +142,41 @@ internal sealed partial class PackageLoader
 			holdWasActive = false;
 		}
 
+		// [PERF-OK: correctness fix for deferral bookkeeping, not an optimisation.]
 		if ( hotload_batch_ms > 0 )
 		{
-			var deferredForMs = (now - firstDeferredAt) * 1000.0;
-			if ( deferredForMs >= hotload_batch_max_ms )
+			if ( firstDeferredAt >= 0 )
 			{
-				log.Info( $"[hotload-batch] quiet window starved for {deferredForMs:0}ms, over the {hotload_batch_max_ms}ms cap - draining now" );
-				return false;
+				var deferredForMs = (now - firstDeferredAt) * 1000.0;
+				if ( deferredForMs >= hotload_batch_max_ms )
+				{
+					log.Info( $"[hotload-batch] quiet window starved for {deferredForMs:0}ms, over the {hotload_batch_max_ms}ms cap - draining now" );
+					return false;
+				}
 			}
 
 			var quietForMs = (now - lastDllChangeAt) * 1000.0;
 			if ( quietForMs < hotload_batch_ms )
 			{
+				MarkDeferred( now );
 				reason = $"quiet {quietForMs:0}ms/{hotload_batch_ms}ms";
 				return true;
 			}
 		}
 
 		return false;
+	}
+
+	/// <summary>
+	/// Records when the CURRENT run of deferrals began. Only called from a path that is
+	/// actually about to defer — see the note in <see cref="ShouldDeferHotload"/>.
+	/// </summary>
+	private void MarkDeferred( double now )
+	{
+		if ( firstDeferredAt < 0 )
+		{
+			firstDeferredAt = now;
+		}
 	}
 
 	/// <summary>
