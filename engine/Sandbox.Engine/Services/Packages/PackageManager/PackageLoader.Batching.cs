@@ -89,10 +89,18 @@ internal sealed partial class PackageLoader
 	private const string HoldMarkerRelativePath = ".claude/session-state/hotload-hold.active";
 
 	/// <summary>
-	/// How long after process start the on-disk marker is ignored outright, so a leftover
-	/// marker can never hang the editor's initial assembly load. See IsFileHoldActive.
+	/// Set once this loader has completed a drain. Until then the on-disk marker is
+	/// ignored outright, because the editor cannot finish starting up until its initial
+	/// assemblies swap in — deferring THAT load hangs the boot with no way to clear the
+	/// marker from inside the editor (observed for real, three hung boots, 2026-07-26).
+	///
+	/// This replaces a fixed 30s grace, which was measured inadequate: boot took ~90s to
+	/// reach the assembly load, so the grace had long expired. That run only survived
+	/// because the leftover marker had aged past its staleness cap — luck, not the guard.
+	/// A fleet-mate refreshing the marker during a slow boot would have hung it anyway.
+	/// Keyed on the drain itself, the guard holds however long boot takes.
 	/// </summary>
-	private const double BootGraceSeconds = 30.0;
+	private bool hasCompletedInitialDrain;
 
 	private string holdMarkerPath;
 	private bool holdMarkerResolved;
@@ -152,14 +160,10 @@ internal sealed partial class PackageLoader
 			return false;
 
 		// [PERF-OK: boot-safety guard found by a hung startup, not an optimisation.]
-		// NEVER let a marker defer the editor's INITIAL assembly load. The editor cannot
-		// finish starting up until those assemblies swap in, so a marker left behind by a
-		// previous session would hang the boot with no way to clear it from inside the
-		// editor - the exact failure seen on 2026-07-26 before this guard existed.
-		// Boot completes well inside this window; a human editing code never happens
-		// within it. The ConVar hold needs no equivalent guard: it starts false every boot
-		// and only an already-running agent can set it.
-		if ( batchClock.Elapsed.TotalSeconds < BootGraceSeconds )
+		// NEVER let a marker defer the editor's INITIAL assembly load - see the field docs
+		// on hasCompletedInitialDrain. The ConVar hold needs no equivalent guard: it starts
+		// false every boot and only an already-running agent can set it.
+		if ( !hasCompletedInitialDrain )
 			return false;
 
 		if ( now - markerCheckedAt < 0.25 )
@@ -337,6 +341,11 @@ internal sealed partial class PackageLoader
 	/// </summary>
 	private void NoteDrained( bool forced )
 	{
+		// Unconditional, and BEFORE the early-out below: the initial boot drain never
+		// deferred, so it has no firstDeferredAt - but it is exactly the drain that must
+		// flip this flag and unlock marker-based holds for the rest of the session.
+		hasCompletedInitialDrain = true;
+
 		if ( firstDeferredAt < 0 )
 			return;
 
