@@ -110,6 +110,12 @@ internal sealed partial class PackageLoader
 		if ( changedPackageDlls.Any( x => x.ap is null ) )
 			return false;
 
+		// If a hold ever appears to do nothing again, the discriminating probe is three
+		// log.Info lines - one per guard above, plus one at the top of Tick() reporting
+		// `force`. That is how the 2026-07-26 investigation found the real cause was a
+		// force:true at EditorUtility.Projects.WaitForCompiles, not any guard here.
+		// Left OUT of the shipped code because Tick runs every frame and it floods the log.
+
 		// [PERF-OK: correctness fix for the deferral bookkeeping, not an optimisation.]
 		// firstDeferredAt is stamped ONLY on a path that actually returns true. Stamping it
 		// here (as the first draft did) made NoteDrained log "draining ... after 0ms" on every

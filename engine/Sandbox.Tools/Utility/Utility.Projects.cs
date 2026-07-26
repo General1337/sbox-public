@@ -68,9 +68,15 @@ public static partial class EditorUtility
 			FileWatch.Tick();
 
 			// Tick the loader to actually load
-			// FORK PATCH #11: force - this is an explicitly requested load, not the
-			// per-frame drain. Batching it would make the tool look broken.
-			Sandbox.GameInstanceDll.PackageLoader.Tick( force: true );
+			// [PERF-OK: reverting a flag from an earlier draft of this same patch, per the M3 measurement.]
+			// FORK PATCH #11: deliberately NOT force. This is the editor's own
+			// compile-then-load path for locally edited game code - i.e. exactly the
+			// hotload the fleet is trying to batch. An earlier draft forced it here on
+			// the reasoning that it was "an explicitly requested load", which made
+			// hotload_hold a no-op for game code while still batching the menu package.
+			// Nothing here is network-sourced; the join path forces separately in
+			// GameInstanceDll.Network.cs.
+			Sandbox.GameInstanceDll.PackageLoader.Tick();
 
 			// give time for any files to finish being written
 			//await Task.Delay( 1000 );
