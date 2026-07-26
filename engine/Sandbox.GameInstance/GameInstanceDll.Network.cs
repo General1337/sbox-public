@@ -191,7 +191,8 @@ internal partial class GameInstanceDll
 	{
 		if ( !compileGroup.NeedsBuild )
 		{
-			FinishLoadingAssemblies();
+			// FORK PATCH #11: force - never batch the join path. See PackageLoader.Batching.cs.
+			FinishLoadingAssemblies( force: true );
 			return true;
 		}
 
@@ -215,7 +216,10 @@ internal partial class GameInstanceDll
 		//
 		// Do the hotload and stuff
 		//
-		FinishLoadingAssemblies();
+		// FORK PATCH #11: force - the comment above about building synchronously applies
+		// equally to the swap. Batching here would let new-assembly network messages be
+		// read with old assemblies.
+		FinishLoadingAssemblies( force: true );
 
 		return true;
 	}

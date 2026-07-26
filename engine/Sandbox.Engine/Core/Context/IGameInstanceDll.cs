@@ -16,7 +16,8 @@ internal unsafe interface IGameInstanceDll
 	public InputContext InputContext => default;
 
 	public void OnRender( SwapChainHandle_t swapChain );
-	public void FinishLoadingAssemblies();
+	// FORK PATCH #11: force bypasses hotload batching. See PackageLoader.Batching.cs.
+	public void FinishLoadingAssemblies( bool force = false );
 	public TypeLibrary TypeLibrary { get; }
 	public void OnProjectConfigChanged( Package package );
 

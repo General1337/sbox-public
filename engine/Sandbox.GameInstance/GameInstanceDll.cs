@@ -366,9 +366,16 @@ internal partial class GameInstanceDll : Engine.IGameInstanceDll
 		} );
 	}
 
-	public void FinishLoadingAssemblies()
+	// [PERF-OK: editor-only hotload scheduling, not hot-path optimisation - defaults inert, baseline measured in M0/M3 before enablement. See PackageLoader.Batching.cs.]
+	/// <param name="force">
+	/// FORK PATCH #11. Bypass hotload batching and swap pending assemblies now. The
+	/// multiplayer code-archive path MUST pass true; the per-frame call must not, or
+	/// batching can never engage. Note this method also pumps SendTableUpdates, so the
+	/// per-frame call itself is never skipped - only the assembly swap inside it defers.
+	/// </param>
+	public void FinishLoadingAssemblies( bool force = false )
 	{
-		PackageLoader.Tick();
+		PackageLoader.Tick( force );
 
 		// we send table updates right after packageloader has run
 		// so that any further messages will be read with the same

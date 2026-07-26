@@ -68,7 +68,9 @@ public static partial class EditorUtility
 			FileWatch.Tick();
 
 			// Tick the loader to actually load
-			Sandbox.GameInstanceDll.PackageLoader.Tick();
+			// FORK PATCH #11: force - this is an explicitly requested load, not the
+			// per-frame drain. Batching it would make the tool look broken.
+			Sandbox.GameInstanceDll.PackageLoader.Tick( force: true );
 
 			// give time for any files to finish being written
 			//await Task.Delay( 1000 );

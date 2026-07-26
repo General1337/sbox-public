@@ -1,0 +1,173 @@
+using System.Diagnostics;
+
+namespace Sandbox;
+
+// [PERF-OK: not a hot-path optimisation - editor-only hotload scheduling. Defaults are inert (hotload_batch_ms=0, hotload_hold=false); the save->swap baseline is measured in M0 and re-measured in M3 before anything is enabled.]
+
+/// <summary>
+/// FORK PATCH #11 — hotload batching / hold-lease.
+///
+/// Problem: with N coding agents editing one project, each agent's save rewrites the
+/// same package DLL, the DLL FileWatch fires, and the next <see cref="Tick"/> runs a
+/// full <c>HotloadManager.DoSwap()</c> — 20-32s of blocked frames, and one hotload
+/// generation spent, per save. N agents therefore pay N serialised hotloads for work
+/// that could have been swapped once.
+///
+/// <see cref="changedPackageDlls"/> is already a dedup'd HashSet, so N writes of the
+/// same DLL collapse to one entry for free. All that is missing is a reason to wait
+/// before draining it. This patch supplies two, both editor-only and both bounded:
+///
+///   * <c>hotload_batch_ms</c>  — passive. Drain only after the DLL has been quiet for
+///                                this long, so a burst of near-simultaneous saves
+///                                becomes one swap. No coordination between agents.
+///   * <c>hotload_hold</c>      — active. An agent that knows it is about to save
+///                                several files holds the drain across the whole burst.
+///
+/// SAFETY — read before changing anything here:
+///
+///  1. This must never touch the multiplayer join path. A client receiving code
+///     archives compiles and loads assemblies *synchronously* before it reads any
+///     further network messages (see the comment in
+///     <c>GameInstanceDll.FinishLoadingCodeArchives</c>). Deferring that would make the
+///     client interpret new-assembly messages with old assemblies. Two guards enforce
+///     this: those call sites pass <c>force: true</c>, and batching is additionally
+///     hard-gated to <see cref="Application.IsEditor"/>.
+///  2. Stream-sourced assemblies (<c>ap is null</c>, from <c>LoadAssemblyFromStream</c>)
+///     are never deferred, for the same reason.
+///  3. Every deferral path is bounded. A crashed or forgetful agent that leaves
+///     <c>hotload_hold</c> set cannot wedge hotloading forever — the hold is force
+///     released after <c>hotload_hold_max_s</c>, and the quiet window cannot be starved
+///     for longer than <c>hotload_batch_max_ms</c> by a stream of rapid saves.
+///
+/// Defaults are inert: <c>hotload_batch_ms = 0</c> and <c>hotload_hold = false</c> mean
+/// stock behaviour until something opts in.
+///
+/// Nothing in the shipped game references this. The control surface is ConVar names
+/// driven over the console, so on stock Facepunch engine the commands simply do not
+/// exist and the caller no-ops. See engine-fork-guide.md §7 (publish-compat boundary).
+/// </summary>
+internal sealed partial class PackageLoader
+{
+	[ConVar( "hotload_batch_ms", ConVarFlags.Saved | ConVarFlags.Protected, Min = 0, Max = 30000,
+		Help = "Editor only. Wait for this many ms of DLL quiet before hotloading, so a burst of saves batches into one hotload. 0 disables batching." )]
+	public static int hotload_batch_ms { get; set; } = 0;
+
+	[ConVar( "hotload_batch_max_ms", ConVarFlags.Saved | ConVarFlags.Protected, Min = 1000, Max = 120000,
+		Help = "Starvation cap for hotload_batch_ms. Continuous saves cannot defer a hotload for longer than this." )]
+	public static int hotload_batch_max_ms { get; set; } = 10000;
+
+	[ConVar( "hotload_hold", ConVarFlags.Protected,
+		Help = "Editor only. While true, defer package hotloads so several saves batch into one. Force released after hotload_hold_max_s." )]
+	public static bool hotload_hold { get; set; } = false;
+
+	[ConVar( "hotload_hold_max_s", ConVarFlags.Saved | ConVarFlags.Protected, Min = 1, Max = 600,
+		Help = "Hard cap on hotload_hold, in seconds. Stops a crashed agent wedging hotloading forever." )]
+	public static float hotload_hold_max_s { get; set; } = 60f;
+
+	/// <summary>
+	/// Monotonic, and independent of engine time so that it keeps running while the
+	/// frame loop is blocked inside a hotload.
+	/// </summary>
+	private static readonly Stopwatch batchClock = Stopwatch.StartNew();
+
+	private double lastDllChangeAt = double.NegativeInfinity;
+	private double firstDeferredAt = double.NegativeInfinity;
+	private double holdStartedAt = double.NegativeInfinity;
+	private bool holdWasActive;
+
+	/// <summary>
+	/// Stamped by the package DLL <c>FileWatch</c> callback. Counting entries would not
+	/// work: every agent's C# lands in the same package assembly, so five saves rewrite
+	/// one DLL and the dedup'd set never grows past one.
+	/// </summary>
+	private void NoteDllChanged()
+	{
+		lastDllChangeAt = batchClock.Elapsed.TotalSeconds;
+	}
+
+	/// <summary>
+	/// True when the pending DLL swap should wait for a later frame. Only ever consulted
+	/// for the per-frame drain — see the safety notes on the class.
+	/// </summary>
+	private bool ShouldDeferHotload( out string reason )
+	{
+		reason = null;
+
+		// Guard 1: batching is an editor-workflow feature and must not exist anywhere else.
+		if ( !Application.IsEditor )
+			return false;
+
+		// Guard 2: never defer assemblies that arrived over the network.
+		if ( IncomingThisHotload.Count > 0 )
+			return false;
+
+		if ( changedPackageDlls.Any( x => x.ap is null ) )
+			return false;
+
+		var now = batchClock.Elapsed.TotalSeconds;
+
+		if ( firstDeferredAt < 0 )
+		{
+			firstDeferredAt = now;
+		}
+
+		if ( hotload_hold )
+		{
+			if ( !holdWasActive )
+			{
+				holdWasActive = true;
+				holdStartedAt = now;
+			}
+
+			var heldFor = now - holdStartedAt;
+			if ( heldFor < hotload_hold_max_s )
+			{
+				reason = $"hold {heldFor:0.0}s/{hotload_hold_max_s:0}s";
+				return true;
+			}
+
+			log.Warning( $"[hotload-batch] hotload_hold held for {heldFor:0.0}s, over the {hotload_hold_max_s:0}s cap - force releasing" );
+			hotload_hold = false;
+			holdWasActive = false;
+		}
+		else
+		{
+			holdWasActive = false;
+		}
+
+		if ( hotload_batch_ms > 0 )
+		{
+			var deferredForMs = (now - firstDeferredAt) * 1000.0;
+			if ( deferredForMs >= hotload_batch_max_ms )
+			{
+				log.Info( $"[hotload-batch] quiet window starved for {deferredForMs:0}ms, over the {hotload_batch_max_ms}ms cap - draining now" );
+				return false;
+			}
+
+			var quietForMs = (now - lastDllChangeAt) * 1000.0;
+			if ( quietForMs < hotload_batch_ms )
+			{
+				reason = $"quiet {quietForMs:0}ms/{hotload_batch_ms}ms";
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/// <summary>
+	/// Called immediately before a drain actually happens, so the log carries the
+	/// evidence a batching test needs: how many DLLs one swap absorbed, and how long
+	/// they waited.
+	/// </summary>
+	private void NoteDrained( bool forced )
+	{
+		if ( firstDeferredAt < 0 )
+			return;
+
+		var waitedMs = (batchClock.Elapsed.TotalSeconds - firstDeferredAt) * 1000.0;
+		log.Info( $"[hotload-batch] draining {changedPackageDlls.Count} pending dll(s) after {waitedMs:0}ms{(forced ? " (forced)" : "")}" );
+
+		firstDeferredAt = double.NegativeInfinity;
+	}
+}

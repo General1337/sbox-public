@@ -390,6 +390,9 @@ internal sealed partial class PackageLoader : IDisposable
 			fw.OnChangedFile += dllName =>
 			{
 				changedPackageDlls.Add( (ap, dllName) );
+
+				// FORK PATCH #11: stamp the burst clock. See PackageLoader.Batching.cs.
+				NoteDllChanged();
 			};
 			dllWatchers.Add( fw );
 
@@ -807,12 +810,31 @@ internal sealed partial class PackageLoader : IDisposable
 		HotloadManager.Ignore( assembly );
 	}
 
-	public void Tick()
+	// [PERF-OK: editor-only hotload scheduling, not hot-path optimisation - defaults inert, baseline measured in M0/M3 before enablement. See PackageLoader.Batching.cs.]
+	/// <param name="force">
+	/// Drain immediately, ignoring FORK PATCH #11 batching. The multiplayer join path
+	/// MUST pass true — it loads streamed assemblies synchronously before reading any
+	/// further network messages. See PackageLoader.Batching.cs for the full contract.
+	/// </param>
+	public void Tick( bool force = false )
 	{
 		if ( !changedPackageDlls.Any() && IncomingThisHotload.Count == 0 )
 		{
 			return;
 		}
+
+		// FORK PATCH #11: let a burst of saves settle into one swap.
+		if ( !force && ShouldDeferHotload( out var deferReason ) )
+		{
+			if ( HotloadManager.hotload_log > 0 )
+			{
+				log.Trace( $"[hotload-batch] deferring hotload ({deferReason})" );
+			}
+
+			return;
+		}
+
+		NoteDrained( force );
 
 		LoadPendingChanges();
 
