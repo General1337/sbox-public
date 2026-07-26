@@ -70,6 +70,133 @@ internal sealed partial class PackageLoader
 		Help = "Hard cap on hotload_hold, in seconds. Stops a crashed agent wedging hotloading forever." )]
 	public static float hotload_hold_max_s { get; set; } = 60f;
 
+	// [PERF-OK: file-hold seam so non-MCP processes can drive batching; not an optimisation.]
+	[ConVar( "hotload_hold_file", ConVarFlags.Saved,
+		Help = "Editor only. Also honour an on-disk hold marker at <project-root>/.claude/session-state/hotload-hold.active, so processes without an editor connection (the editor mutex, hooks) can batch hotloads." )]
+	public static bool hotload_hold_file { get; set; } = true;
+
+	/// <summary>
+	/// The marker is a FILE rather than the <c>hotload_hold</c> ConVar because the things
+	/// that know when an agent is editing — the editor-mutex daemon, the shell hooks — are
+	/// plain Python/bash with no connection to this editor. A ConVar can only be set over
+	/// the console, which only an MCP-connected agent has. Same trick as the
+	/// <c>.analyzers-on</c> gate in Compiler.Analyzers.cs.
+	///
+	/// Existence is the whole protocol; contents are ignored. Staleness is bounded by the
+	/// same <see cref="hotload_hold_max_s"/> cap as the ConVar hold, so a crashed writer
+	/// costs one late hotload and never a wedge.
+	/// </summary>
+	private const string HoldMarkerRelativePath = ".claude/session-state/hotload-hold.active";
+
+	/// <summary>
+	/// How long after process start the on-disk marker is ignored outright, so a leftover
+	/// marker can never hang the editor's initial assembly load. See IsFileHoldActive.
+	/// </summary>
+	private const double BootGraceSeconds = 30.0;
+
+	private string holdMarkerPath;
+	private bool holdMarkerResolved;
+	private double markerCheckedAt = double.NegativeInfinity;
+	private bool markerHeldCached;
+
+	/// <summary>
+	/// Resolved from a loaded LOCAL package's project root. Cached — the answer cannot
+	/// change without a package reload, and this is consulted while a drain is pending.
+	/// </summary>
+	private string ResolveHoldMarkerPath()
+	{
+		if ( holdMarkerResolved )
+			return holdMarkerPath;
+
+		holdMarkerResolved = true;
+
+		try
+		{
+			foreach ( var ap in loadedPackages )
+			{
+				if ( ap.Package is not LocalPackage local || local.Project is null )
+					continue;
+
+				var root = local.Project.GetRootPath();
+				if ( string.IsNullOrWhiteSpace( root ) )
+					continue;
+
+				var candidate = System.IO.Path.Combine( root, HoldMarkerRelativePath.Replace( '/', System.IO.Path.DirectorySeparatorChar ) );
+
+				// Anchor on the project that actually has the agent state directory,
+				// so the menu/tool packages do not win the race on a fleet checkout.
+				if ( System.IO.Directory.Exists( System.IO.Path.GetDirectoryName( candidate ) ) )
+				{
+					holdMarkerPath = candidate;
+					return holdMarkerPath;
+				}
+
+				holdMarkerPath ??= candidate;
+			}
+		}
+		catch ( System.Exception e )
+		{
+			log.Warning( $"[hotload-batch] could not resolve the hold-marker path: {e.Message}" );
+		}
+
+		return holdMarkerPath;
+	}
+
+	/// <summary>
+	/// True while a non-MCP process is holding the hotload. Polled at most every 250 ms —
+	/// this runs per frame while a drain is pending, and a stat() per frame is wasteful.
+	/// </summary>
+	private bool IsFileHoldActive( double now )
+	{
+		if ( !hotload_hold_file )
+			return false;
+
+		// [PERF-OK: boot-safety guard found by a hung startup, not an optimisation.]
+		// NEVER let a marker defer the editor's INITIAL assembly load. The editor cannot
+		// finish starting up until those assemblies swap in, so a marker left behind by a
+		// previous session would hang the boot with no way to clear it from inside the
+		// editor - the exact failure seen on 2026-07-26 before this guard existed.
+		// Boot completes well inside this window; a human editing code never happens
+		// within it. The ConVar hold needs no equivalent guard: it starts false every boot
+		// and only an already-running agent can set it.
+		if ( batchClock.Elapsed.TotalSeconds < BootGraceSeconds )
+			return false;
+
+		if ( now - markerCheckedAt < 0.25 )
+			return markerHeldCached;
+
+		markerCheckedAt = now;
+		markerHeldCached = false;
+
+		var path = ResolveHoldMarkerPath();
+		if ( string.IsNullOrEmpty( path ) )
+			return false;
+
+		try
+		{
+			if ( !System.IO.File.Exists( path ) )
+				return false;
+
+			// A writer that died leaves the marker behind. Treat an old marker as absent
+			// rather than trusting it - same bound as the ConVar hold.
+			var age = System.DateTime.UtcNow - System.IO.File.GetLastWriteTimeUtc( path );
+			if ( age.TotalSeconds > hotload_hold_max_s )
+			{
+				log.Warning( $"[hotload-batch] hold marker is {age.TotalSeconds:0}s old, over the {hotload_hold_max_s:0}s cap - ignoring it" );
+				return false;
+			}
+
+			markerHeldCached = true;
+		}
+		catch ( System.Exception )
+		{
+			// A half-written or locked marker must never block hotloading.
+			markerHeldCached = false;
+		}
+
+		return markerHeldCached;
+	}
+
 	/// <summary>
 	/// Monotonic, and independent of engine time so that it keeps running while the
 	/// frame loop is blocked inside a hotload.
@@ -123,6 +250,24 @@ internal sealed partial class PackageLoader
 		// normal one in the M3 evidence.
 		var now = batchClock.Elapsed.TotalSeconds;
 
+		// [PERF-OK: file-hold seam, same correctness fix family as the stamp above.]
+		// Either source can hold: the ConVar (an MCP-connected agent) or the on-disk
+		// marker (the editor mutex / hooks, which have no editor connection).
+		//
+		// The two are bounded DIFFERENTLY, and conflating them is a real bug that was
+		// measured 2026-07-26: the marker already carries its own liveness in its mtime
+		// (aged out in IsFileHoldActive), so applying the continuous-duration cap to it as
+		// well force-released a fleet that was still actively editing and refreshing the
+		// marker, every cap interval. The duration cap exists for the ConVar precisely
+		// BECAUSE the ConVar has no liveness signal - an agent sets it and may die.
+		if ( IsFileHoldActive( now ) )
+		{
+			holdWasActive = false;   // ConVar-hold bookkeeping does not apply to the marker
+			MarkDeferred( now );
+			reason = "hold (marker)";
+			return true;
+		}
+
 		if ( hotload_hold )
 		{
 			if ( !holdWasActive )
@@ -135,7 +280,7 @@ internal sealed partial class PackageLoader
 			if ( heldFor < hotload_hold_max_s )
 			{
 				MarkDeferred( now );
-				reason = $"hold {heldFor:0.0}s/{hotload_hold_max_s:0}s";
+				reason = $"hold {heldFor:0.0}s/{hotload_hold_max_s:0}s (convar)";
 				return true;
 			}
 
