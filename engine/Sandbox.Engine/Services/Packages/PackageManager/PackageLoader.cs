@@ -611,8 +611,13 @@ internal sealed partial class PackageLoader : IDisposable
 
 		var sw = Stopwatch.StartNew();
 
-		if ( !ILHotload.Replace( outgoing?.Assembly, outgoing?.ModifiedAssembly ?? outgoing?.Assembly, incoming?.Assembly ) )
+		string consoleMetadataReason = null;
+		if ( !ILHotload.Replace( outgoing?.Assembly, outgoing?.ModifiedAssembly ?? outgoing?.Assembly, incoming?.Assembly,
+			changes => ConVarSystem.CanFastHotload( changes, out consoleMetadataReason ) ) )
+		{
+			if ( consoleMetadataReason is not null ) log.Info( $"Fast hotload rejected: {consoleMetadataReason}" );
 			return false;
+		}
 
 		sw.Stop();
 

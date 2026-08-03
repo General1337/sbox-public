@@ -63,7 +63,8 @@ public partial class ILHotload : IDisposable
 		DetourFactory = null;
 	}
 
-	public bool Replace( Assembly baseAssembly, Assembly oldIlHotloadAssembly, Assembly newIlHotloadAssembly )
+	public bool Replace( Assembly baseAssembly, Assembly oldIlHotloadAssembly, Assembly newIlHotloadAssembly,
+		Func<(MethodBase Old, MethodBase New)[], bool> validateChanges = null )
 	{
 		if ( !IsSupported )
 		{
@@ -94,6 +95,8 @@ public partial class ILHotload : IDisposable
 
 			return false;
 		}
+
+		if ( validateChanges is not null && !validateChanges( changes ) ) return false;
 
 		//
 		// We shouldn't do IL replacement hotloading when the debugger is attached for two reasons:
