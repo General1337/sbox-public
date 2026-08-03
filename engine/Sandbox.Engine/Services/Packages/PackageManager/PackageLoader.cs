@@ -826,12 +826,18 @@ internal sealed partial class PackageLoader : IDisposable
 
 	void OnFullHotloadSuccess()
 	{
-		foreach ( var loadedAssembly in IncomingThisHotload )
-		{
-			TriggerRegisterEvent( loadedAssembly );
-		}
+		const int maxRegistrations = 1024;
+		var result = DrainHotloadRegistrations(
+			IncomingThisHotload,
+			TriggerRegisterEvent,
+			OnHotloadSuccess,
+			maxRegistrations,
+			exception => log.Warning( exception, "Assembly registration failed during full hotload completion" ) );
 
-		OnHotloadSuccess();
+		if ( result.LimitReached )
+		{
+			log.Warning( $"Full hotload registration stopped after examining {maxRegistrations} entries; later additions were left unregistered" );
+		}
 	}
 
 	void OnHotloadSuccess()
