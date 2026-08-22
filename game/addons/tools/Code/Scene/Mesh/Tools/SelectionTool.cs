@@ -121,6 +121,10 @@ public abstract class SelectionTool( MeshTool tool ) : EditorTool
 	{
 	}
 
+	public virtual void NudgeRotation( Vector2 direction )
+	{
+	}
+
 	public virtual void AlignDown( bool useLocalDown )
 	{
 	}
@@ -222,6 +226,30 @@ file class SelectionToolShortcutsWidget( SelectionTool tool ) : Widget
 
 	[Shortcut( "mesh.selection-nudge-right", "RIGHT", typeof( SceneViewWidget ) )]
 	public void NudgeRight() => tool.Nudge( Vector2.Right );
+
+	[Shortcut( "mesh.selection-rotate-up", "ALT+UP", typeof( SceneViewWidget ) )]
+	public void RotateUp() => tool.NudgeRotation( Vector2.Up );
+
+	[Shortcut( "mesh.selection-rotate-down", "ALT+DOWN", typeof( SceneViewWidget ) )]
+	public void RotateDown() => tool.NudgeRotation( Vector2.Down );
+
+	[Shortcut( "mesh.selection-rotate-left", "ALT+LEFT", typeof( SceneViewWidget ) )]
+	public void RotateLeft() => tool.NudgeRotation( Vector2.Left );
+
+	[Shortcut( "mesh.selection-rotate-right", "ALT+RIGHT", typeof( SceneViewWidget ) )]
+	public void RotateRight() => tool.NudgeRotation( Vector2.Right );
+
+	[Shortcut( "mesh.selection-rotate-duplicate-up", "ALT+SHIFT+UP", typeof( SceneViewWidget ) )]
+	public void RotateDuplicateUp() => tool.NudgeRotation( Vector2.Up );
+
+	[Shortcut( "mesh.selection-rotate-duplicate-down", "ALT+SHIFT+DOWN", typeof( SceneViewWidget ) )]
+	public void RotateDuplicateDown() => tool.NudgeRotation( Vector2.Down );
+
+	[Shortcut( "mesh.selection-rotate-duplicate-left", "ALT+SHIFT+LEFT", typeof( SceneViewWidget ) )]
+	public void RotateDuplicateLeft() => tool.NudgeRotation( Vector2.Left );
+
+	[Shortcut( "mesh.selection-rotate-duplicate-right", "ALT+SHIFT+RIGHT", typeof( SceneViewWidget ) )]
+	public void RotateDuplicateRight() => tool.NudgeRotation( Vector2.Right );
 
 	[Shortcut( "mesh.align-down-local", "CTRL+KP_1", typeof( SceneViewWidget ) )]
 	public void AlignDownLocal() => tool.AlignDown( useLocalDown: true );
@@ -663,20 +691,12 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 				Gizmo.Draw.LineThickness = 1;
 				Gizmo.Draw.IgnoreDepth = true;
 				Gizmo.Draw.Color = edgeColor.Darken( 0.3f ).WithAlpha( 0.1f );
-
-				foreach ( var v in mesh.Mesh.GetEdges() )
-				{
-					Gizmo.Draw.Line( v );
-				}
+				Gizmo.Draw.Lines( mesh.Mesh.GetVisibleEdges() );
 
 				Gizmo.Draw.Color = edgeColor;
 				Gizmo.Draw.IgnoreDepth = false;
 				Gizmo.Draw.LineThickness = 2;
-
-				foreach ( var v in mesh.Mesh.GetEdges() )
-				{
-					Gizmo.Draw.Line( v );
-				}
+				Gizmo.Draw.Lines( mesh.Mesh.GetVisibleEdges() );
 			}
 
 			if ( DrawVertices )
@@ -688,7 +708,7 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 					Gizmo.Draw.IgnoreDepth = true;
 					Gizmo.Draw.Color = vertexColor.Darken( 0.3f ).WithAlpha( 0.2f );
 
-					foreach ( var v in mesh.Mesh.GetVertexPositions() )
+					foreach ( var v in mesh.Mesh.GetVisibleVertexPositions() )
 					{
 						Gizmo.Draw.Sprite( v, 8, null, false );
 					}
@@ -696,7 +716,7 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 					Gizmo.Draw.Color = vertexColor;
 					Gizmo.Draw.IgnoreDepth = false;
 
-					foreach ( var v in mesh.Mesh.GetVertexPositions() )
+					foreach ( var v in mesh.Mesh.GetVisibleVertexPositions() )
 					{
 						Gizmo.Draw.Sprite( v, 8, null, false );
 					}
@@ -768,6 +788,51 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 		}
 
 		Pivot -= delta;
+
+		Tool?.MoveMode?.OnBegin( this );
+	}
+
+	public override void NudgeRotation( Vector2 direction )
+	{
+		if ( !Selection.Any() ) return;
+
+		var viewport = SceneViewWidget.Current?.LastSelectedViewportWidget;
+		if ( !viewport.IsValid() ) return;
+
+		var gizmo = viewport.GizmoInstance;
+		if ( gizmo is null ) return;
+
+		using var gizmoScope = gizmo.Push();
+		if ( Gizmo.Pressed.Any ) return;
+
+		var basis = CalculateSelectionBasis();
+		var screenRight = -Gizmo.Nudge( basis, Vector2.Right ).Normal;
+		var screenUp = -Gizmo.Nudge( basis, Vector2.Up ).Normal;
+		var faceNormal = screenRight.Cross( screenUp ).Normal;
+
+		var axis = direction.x != 0.0f
+			? faceNormal
+			: screenRight;
+
+		var angle = direction.x != 0.0f
+			? direction.x * Gizmo.Settings.AngleSpacing
+			: -direction.y * Gizmo.Settings.AngleSpacing;
+
+		var delta = Rotation.FromAxis( axis, angle );
+
+		StartDrag();
+
+		try
+		{
+			Rotate( Pivot, Rotation.Identity, delta );
+			UpdateDrag();
+		}
+		finally
+		{
+			EndDrag();
+		}
+
+		Tool?.MoveMode?.OnBegin( this );
 	}
 
 	private void UpdateTexturesAfterNudge()
@@ -1228,6 +1293,9 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 			{
 				foreach ( var h in mesh.VertexHandles )
 				{
+					if ( mesh.IsVertexHidden( h ) )
+						continue;
+
 					var worldPos = transform.PointToWorld( mesh.GetVertexPosition( h ) );
 					var vertex = (T)(object)new MeshVertex( component, h );
 
@@ -1258,6 +1326,9 @@ public abstract class SelectionTool<T>( MeshTool tool ) : SelectionTool( tool ) 
 				foreach ( var h in mesh.HalfEdgeHandles )
 				{
 					if ( h.Index > mesh.GetOppositeHalfEdge( h ).Index )
+						continue;
+
+					if ( mesh.IsEdgeHidden( h ) )
 						continue;
 
 					mesh.GetEdgeVertices( h, out var vA, out var vB );

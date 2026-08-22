@@ -42,6 +42,7 @@ public static partial class AssetSystem
 			// download the manifest
 			await package.Revision.DownloadManifestAsync( token );
 
+			using var suppressWatchers = FileWatch.Suppress();
 			await DownloadCloudFiles( package, loading, token );
 
 			foreach ( var file in package.Revision.Manifest.Files )
@@ -256,9 +257,6 @@ public static partial class AssetSystem
 
 		IToolsDll.Current?.RunEvent( "package.download.start", package, token );
 
-		//
-		// Process 16 files at a time
-		//
 		await package.Revision.Manifest.Files.ForEachTaskAsync( async ( e ) =>
 		{
 			await DownloadFile( package, e, token );
@@ -267,7 +265,7 @@ public static partial class AssetSystem
 			float frac = (float)((double)downloaded / (double)totalSize);
 			progress?.Invoke( frac );
 			IToolsDll.Current?.RunEvent( "package.download.update", package, frac );
-		}, 16 );
+		}, Package.MaxParallelDownloads );
 
 		IToolsDll.Current?.RunEvent( "package.download.complete", package );
 	}
