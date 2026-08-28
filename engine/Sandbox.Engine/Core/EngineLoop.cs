@@ -39,6 +39,20 @@ internal static class EngineLoop
 		double time = RealTime.NowDouble;
 		FastTimer frameTimer = FastTimer.StartNew();
 
+		// The gap between the previous loop's return and this call: native message pump, window
+		// present/vsync wait and anything else the host does between managed loops. Without this
+		// row the frame table has an unnamed remainder that no managed bracket can own. Keyed to the
+		// loop that just ended (FrameCount has not been incremented yet).
+		if ( PerformanceStats.LastLoopEndTicks != 0 && PerformanceTailAttribution.Enabled )
+		{
+			var betweenTail = new PerformanceTailAttribution.Token(
+				PerformanceStats.LastLoopEndTicks,
+				GC.GetAllocatedBytesForCurrentThread(),
+				GC.GetTotalPauseDuration().Ticks,
+				Application.FrameCount );
+			PerformanceTailAttribution.End( betweenTail, "engine.frame", "BetweenLoops" );
+		}
+
 		using ( _runFrame.Start() )
 		{
 			Application.FrameCount++;
@@ -72,6 +86,7 @@ internal static class EngineLoop
 				wantsQuit = !EngineGlobal.SourceEngineFrame( appDict, time, previousTime );
 			}
 			PerformanceTailAttribution.End( sourceFrameTail, "engine.frame", "SourceEngineFrame" );
+			PerformanceStats.PollGpuFrameTime( 1 );
 
 			if ( wantsQuit )
 			{
@@ -92,6 +107,7 @@ internal static class EngineLoop
 				finally
 				{
 					PerformanceTailAttribution.End( frameEndTail, "engine.frame", "FrameEnd" );
+					PerformanceStats.PollGpuFrameTime( 2 );
 				}
 
 				var toolsRunTail = PerformanceTailAttribution.Begin();
@@ -113,6 +129,7 @@ internal static class EngineLoop
 		var sleepTail = PerformanceTailAttribution.Begin();
 		SleepForFrameRateClamp( frameTimer );
 		PerformanceTailAttribution.End( sleepTail, "engine.frame", "FrameRateClamp" );
+		PerformanceStats.LastLoopEndTicks = System.Diagnostics.Stopwatch.GetTimestamp();
 
 		previousTime = time;
 	}
@@ -273,22 +290,32 @@ internal static class EngineLoop
 		//
 		// Update performance stats (should be called every frame)
 		//
+		var perfTail = PerformanceTailAttribution.Begin();
 		UpdatePerformance();
+		PerformanceTailAttribution.End( perfTail, "engine.framestart", "UpdatePerformance" );
+		var overlayTail = PerformanceTailAttribution.Begin();
 		DebugOverlay.Draw();
+		PerformanceTailAttribution.End( overlayTail, "engine.framestart", "DebugOverlay.Draw" );
+		var inputTail = PerformanceTailAttribution.Begin();
 		UpdateInput();
+		PerformanceTailAttribution.End( inputTail, "engine.framestart", "UpdateInput" );
 
 		//
 		// Dispatch callbacks for any changed files
 		//
+		var fileWatchTail = PerformanceTailAttribution.Begin();
 		FileWatch.Tick();
+		PerformanceTailAttribution.End( fileWatchTail, "engine.framestart", "FileWatch.Tick" );
 
 		//
 		// Update any animated textures
 		//
+		var textureTail = PerformanceTailAttribution.Begin();
 		using ( PerformanceStats.Timings.Video.Scope() )
 		{
 			Texture.Tick();
 		}
+		PerformanceTailAttribution.End( textureTail, "engine.framestart", "Texture.Tick" );
 
 		//
 		// Update VR
@@ -547,6 +574,7 @@ internal static class EngineLoop
 		// PerformanceStats.Timings.Get(name) API, so no fork-only symbol leaks into addons.
 		// Its call count is the authoritative answer to "did this engine loop output a frame?".
 		PerformanceStats.Timings.Get( "Frame.Output" ).AddMilliseconds( 0 );
+		PerformanceStats.PollGpuFrameTime( 3 );
 
 		using var _outputScope = _clientOutput.Start();
 

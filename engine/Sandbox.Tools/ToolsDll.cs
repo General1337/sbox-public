@@ -328,6 +328,9 @@ internal class ToolsDll : IToolsDll
 		{
 			if ( ShouldRunToolsFrame() )
 			{
+				// Call-count marker (0 ms): lets a per-loop ledger tell "this loop ran the 30 Hz editor
+				// tools frame" apart from loops that did not, without a fork-only symbol in game code.
+				Sandbox.Diagnostics.PerformanceStats.Timings.Get( "Editor.ToolsFrame" ).AddMilliseconds( 0 );
 				var runFrameTail = Sandbox.Diagnostics.PerformanceTailAttribution.Begin();
 				g_pToolFramework2.Tools_RunFrame();
 				Sandbox.Diagnostics.PerformanceTailAttribution.End( runFrameTail, "editor.tools.native", "Tools_RunFrame" );

@@ -107,7 +107,9 @@ internal static partial class DebugOverlay
 		}
 
 		// GPU Profiler
-		Diagnostics.GpuProfilerStats.Enabled = overlay_gpu == 1;
+		// ForceEnabled lets a diagnostic recorder keep the native timestamp profiler on without
+		// drawing this overlay (the overlay itself is GPU work the recorder must not add).
+		Diagnostics.GpuProfilerStats.Enabled = overlay_gpu == 1 || Diagnostics.GpuProfilerStats.ForceEnabled;
 		Diagnostics.GpuProfilerStats.Update();
 
 		if ( overlay_gpu == 1 )
