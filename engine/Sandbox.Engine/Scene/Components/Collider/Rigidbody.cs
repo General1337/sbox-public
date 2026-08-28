@@ -668,6 +668,11 @@ sealed public partial class Rigidbody : Component, Component.ExecuteInEditor, IG
 		if ( isUpdatingFromPhysics ) return;
 		if ( IsProxy ) return;
 		if ( Transform.InsideChangeCallback ) return;
+		// Exact native-root interpolation is visual-only. The root body already returns through
+		// InsideChangeCallback; keep its welded child bodies simulation-owned instead of teleporting
+		// all of them to the interpolated render pose every output frame.
+		if ( SceneModelTransformParentSystem.SkipRigidbodyTargetCallbacks
+			&& Transform.InsideNativeParentTargetPropagation ) return;
 
 		// Teleport physics body.
 		if ( _body.IsValid() )

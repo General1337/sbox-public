@@ -42,11 +42,14 @@ internal static class EngineLoop
 		using ( _runFrame.Start() )
 		{
 			Application.FrameCount++;
+			var preambleTail = PerformanceTailAttribution.Begin();
 			RealTime.Update( time );
 			Time.Update( RealTime.Now, RealTime.Delta );
 
 			DebugOverlay.Reset();
+			PerformanceTailAttribution.End( preambleTail, "engine.frame", "Preamble" );
 
+			var frameStartTail = PerformanceTailAttribution.Begin();
 			try
 			{
 				using ( _frameStart.Start() )
@@ -58,11 +61,17 @@ internal static class EngineLoop
 			{
 				Log.Error( e );
 			}
+			finally
+			{
+				PerformanceTailAttribution.End( frameStartTail, "engine.frame", "FrameStart" );
+			}
 
+			var sourceFrameTail = PerformanceTailAttribution.Begin();
 			using ( PerformanceStats.Timings.Render.Scope() )
 			{
 				wantsQuit = !EngineGlobal.SourceEngineFrame( appDict, time, previousTime );
 			}
+			PerformanceTailAttribution.End( sourceFrameTail, "engine.frame", "SourceEngineFrame" );
 
 			if ( wantsQuit )
 			{
@@ -72,11 +81,28 @@ internal static class EngineLoop
 
 			try
 			{
-				using ( _frameEnd.Start() )
+				var frameEndTail = PerformanceTailAttribution.Begin();
+				try
 				{
-					FrameEnd();
+					using ( _frameEnd.Start() )
+					{
+						FrameEnd();
+					}
 				}
-				IToolsDll.Current?.RunFrame();
+				finally
+				{
+					PerformanceTailAttribution.End( frameEndTail, "engine.frame", "FrameEnd" );
+				}
+
+				var toolsRunTail = PerformanceTailAttribution.Begin();
+				try
+				{
+					IToolsDll.Current?.RunFrame();
+				}
+				finally
+				{
+					PerformanceTailAttribution.End( toolsRunTail, "editor.tools", "RunFrame" );
+				}
 			}
 			catch ( System.Exception e )
 			{
@@ -84,7 +110,9 @@ internal static class EngineLoop
 			}
 		}
 
+		var sleepTail = PerformanceTailAttribution.Begin();
 		SleepForFrameRateClamp( frameTimer );
+		PerformanceTailAttribution.End( sleepTail, "engine.frame", "FrameRateClamp" );
 
 		previousTime = time;
 	}
@@ -503,19 +531,38 @@ internal static class EngineLoop
 	static Superluminal _gameRender = new Superluminal( "Game Render", "#3a6e4d" );
 	static Superluminal _menuRender = new Superluminal( "Menu Render", "#6e3a6e" );
 
+	static void RecordOutputAllocationKb( string name, ref long checkpoint )
+	{
+		var now = GC.GetAllocatedBytesForCurrentThread();
+		var bytes = Math.Max( 0L, now - checkpoint );
+		checkpoint = now;
+		PerformanceStats.Timings.Get( name ).AddMilliseconds( bytes / 1024.0 );
+	}
+
 	internal static void OnClientOutput()
 	{
+		var alloc = GC.GetAllocatedBytesForCurrentThread();
 		RenderedFrames++;
+		// Measurement-only generic seam. Game code reads this through the existing
+		// PerformanceStats.Timings.Get(name) API, so no fork-only symbol leaks into addons.
+		// Its call count is the authoritative answer to "did this engine loop output a frame?".
+		PerformanceStats.Timings.Get( "Frame.Output" ).AddMilliseconds( 0 );
 
 		using var _outputScope = _clientOutput.Start();
 
 		// The editor renders it's own game scene
 		if ( Application.IsEditor )
 		{
+			var panelsTail = PerformanceTailAttribution.Begin();
 			Sandbox.UI.ScenePanel.RenderPending();
+			PerformanceTailAttribution.End( panelsTail, "editor.output", "ScenePanel.RenderPending" );
+			RecordOutputAllocationKb( "AllocKB.Output.ScenePanels", ref alloc );
 
+			var toolsRenderTail = PerformanceTailAttribution.Begin();
 			using ( _toolsRender.Start() )
 				IToolsDll.Current?.OnRender();
+			PerformanceTailAttribution.End( toolsRenderTail, "editor.output", "Tools.OnRender" );
+			RecordOutputAllocationKb( "AllocKB.Output.Tools", ref alloc );
 			return;
 		}
 
@@ -528,17 +575,28 @@ internal static class EngineLoop
 
 		try
 		{
+			var panelsTail = PerformanceTailAttribution.Begin();
 			Sandbox.UI.ScenePanel.RenderPending();
+			PerformanceTailAttribution.End( panelsTail, "output", "ScenePanel.RenderPending" );
+			RecordOutputAllocationKb( "AllocKB.Output.ScenePanels", ref alloc );
 
+			var gameRenderTail = PerformanceTailAttribution.Begin();
 			using ( _gameRender.Start() )
 				IGameInstanceDll.Current?.OnRender( engineChain );
+			PerformanceTailAttribution.End( gameRenderTail, "output", "Game.OnRender" );
+			RecordOutputAllocationKb( "AllocKB.Output.Game", ref alloc );
+			var menuRenderTail = PerformanceTailAttribution.Begin();
 			using ( _menuRender.Start() )
 				IMenuDll.Current?.OnRender( engineChain );
+			PerformanceTailAttribution.End( menuRenderTail, "output", "Menu.OnRender" );
+			RecordOutputAllocationKb( "AllocKB.Output.Menu", ref alloc );
 		}
 		finally
 		{
+			var finishRenderTail = PerformanceTailAttribution.Begin();
 			CSceneSystem.FinishRenderingViews();
 			CSceneSystem.WaitForRenderingToComplete();
+			PerformanceTailAttribution.End( finishRenderTail, "output", "FinishAndWaitRendering" );
 		}
 	}
 

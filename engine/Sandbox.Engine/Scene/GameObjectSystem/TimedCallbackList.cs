@@ -1,5 +1,6 @@
 ﻿
 using Sandbox.Utility;
+using Sandbox.Diagnostics;
 namespace Sandbox;
 
 /// <summary>
@@ -38,13 +39,17 @@ class TimedCallbackList
 
 	static Superluminal _instrument = new Superluminal( "Callback", "#6fced3" );
 
-	public void Run()
+	/// <summary>Compatibility path used by existing unit/integration tests and callers that do not
+	/// have a scene stage. Production scene signals use the attributed overload below.</summary>
+	public void Run() => Run( "listener.unspecified", false );
+
+	public void Run( string stage, bool attributeTail )
 	{
 		for ( int i = 0; i < entries.Count; i++ )
 		{
 			using ( _instrument.Start( entries[i].Description ) )
 			{
-				entries[i].Run();
+				entries[i].Run( stage, attributeTail );
 			}
 		}
 	}
@@ -65,6 +70,7 @@ class TimedCallbackList
 	public class CallbackEntry : IComparable<CallbackEntry>
 	{
 		private Action action;
+		private string tailOwner;
 
 		public int Order { get; private set; }
 		public string ClassName { get; private set; }
@@ -80,6 +86,7 @@ class TimedCallbackList
 			Order = order;
 			ClassName = className;
 			Description = description;
+			tailOwner = $"{className}.{description}";
 		}
 
 		internal void ClearMetrics()
@@ -93,8 +100,9 @@ class TimedCallbackList
 			return new { Name = Description, ClassName, Count = _totalRuns, TotalMs = _totalMilliseconds, Avg = _totalRuns > 0 ? _totalMilliseconds / _totalRuns : 0 };
 		}
 
-		public void Run()
+		public void Run( string stage, bool attributeTail )
 		{
+			var tail = attributeTail ? PerformanceTailAttribution.Begin() : default;
 			try
 			{
 				var timer = FastTimer.StartNew();
@@ -107,6 +115,10 @@ class TimedCallbackList
 			catch ( System.Exception e )
 			{
 				Log.Error( e, $"{ClassName}.{Description}: {e.Message}" );
+			}
+			finally
+			{
+				if ( attributeTail ) PerformanceTailAttribution.End( tail, stage, tailOwner );
 			}
 		}
 

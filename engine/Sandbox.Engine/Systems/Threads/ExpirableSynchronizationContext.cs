@@ -58,16 +58,20 @@ internal class ExpirableSynchronizationContext : SynchronizationContext
 
 	private readonly ConcurrentQueue<ExecutingJob> _executingJobs;
 	private readonly Stopwatch _timer = Stopwatch.StartNew();
+	private readonly Action _workPosted;
+	internal Action WorkPosted => _workPosted;
 
 	private int _currentlyProcessingThreadCount;
 	public bool WarnNonYieldingTasks { get; }
 
 	/// <param name="warnNonYieldingTasks">If true, warn when tasks don't yield after <see cref="MaxTimeBetweenYieldsMillis"/>.</param>
-	public ExpirableSynchronizationContext( bool warnNonYieldingTasks )
+	/// <param name="workPosted">Optional signal invoked after a continuation is successfully queued.</param>
+	public ExpirableSynchronizationContext( bool warnNonYieldingTasks, Action workPosted = null )
 	{
 		SetWaitNotificationRequired();
 
 		WarnNonYieldingTasks = warnNonYieldingTasks;
+		_workPosted = workPosted;
 
 		if ( WarnNonYieldingTasks )
 		{
@@ -118,7 +122,7 @@ internal class ExpirableSynchronizationContext : SynchronizationContext
 
 	public override SynchronizationContext CreateCopy()
 	{
-		return new ExpirableSynchronizationContext( WarnNonYieldingTasks );
+		return new ExpirableSynchronizationContext( WarnNonYieldingTasks, _workPosted );
 	}
 
 	#region Finding State Machine Type
@@ -346,7 +350,7 @@ internal class ExpirableSynchronizationContext : SynchronizationContext
 		var target = GetCurrentContext();
 		var data = new Data( d, state, isCancelled ? this : target );
 
-		target.m_queue.Writer.TryWrite( data );
+		if ( target.m_queue.Writer.TryWrite( data ) ) target._workPosted?.Invoke();
 	}
 
 	public void Expire( ExpirableSynchronizationContext newInstance )
@@ -357,7 +361,8 @@ internal class ExpirableSynchronizationContext : SynchronizationContext
 		{
 			if ( CheckValid( data.State, out var isCancelled ) )
 			{
-				newInstance.m_queue.Writer.TryWrite( new Data( data.Callback, data.State, isCancelled ? this : newInstance ) );
+				if ( newInstance.m_queue.Writer.TryWrite( new Data( data.Callback, data.State, isCancelled ? this : newInstance ) ) )
+					newInstance._workPosted?.Invoke();
 			}
 		}
 	}

@@ -27,6 +27,10 @@ public enum PhysicsSimulationMode
 [Expose, ActionGraphIgnore]
 public sealed partial class PhysicsWorld : IHandle
 {
+	static readonly Sandbox.Diagnostics.PerformanceStats.Timings ProcessIntersectionsTiming
+		= Sandbox.Diagnostics.PerformanceStats.Timings.Get( "Physics.ProcessIntersections" );
+	static readonly Sandbox.Diagnostics.PerformanceStats.Timings ContactNotificationsMetric
+		= Sandbox.Diagnostics.PerformanceStats.Timings.Get( "Physics.ContactNotifications" );
 	[SkipHotload]
 	internal static HashSet<PhysicsWorld> All = new HashSet<PhysicsWorld>();
 
@@ -162,6 +166,7 @@ public sealed partial class PhysicsWorld : IHandle
 
 	internal unsafe void ProcessIntersections()
 	{
+		using var _ = ProcessIntersectionsTiming.Scope();
 		if ( onIntersectionFunctionPointer == DelegateFunctionPointer.Null )
 			onIntersectionFunctionPointer = DelegateFunctionPointer.Get<ProcessIntersectionsDelegate_t>( OnIntersections );
 
@@ -215,6 +220,7 @@ public sealed partial class PhysicsWorld : IHandle
 
 	unsafe void OnIntersections( VPhysIntersectionNotification_t* notifications, int count )
 	{
+		ContactNotificationsMetric.AddMilliseconds( 0, count );
 		for ( int i = 0; i < count; i++ )
 		{
 			try

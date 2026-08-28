@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Sandbox.Diagnostics;
 
 namespace Sandbox;
 
@@ -95,7 +96,19 @@ public partial class Scene
 	/// </summary>
 	internal void Signal( in GameObjectSystem.Stage stage )
 	{
-		GetCallbacks( stage ).Run();
+		var category = stage switch
+		{
+			GameObjectSystem.Stage.StartUpdate => "listener.start_update",
+			GameObjectSystem.Stage.UpdateBones => "listener.update_bones",
+			GameObjectSystem.Stage.PhysicsStep => "listener.physics_step",
+			GameObjectSystem.Stage.Interpolation => "listener.interpolation",
+			GameObjectSystem.Stage.FinishUpdate => "listener.finish_update",
+			GameObjectSystem.Stage.StartFixedUpdate => "listener.start_fixed",
+			GameObjectSystem.Stage.FinishFixedUpdate => "listener.finish_fixed",
+			GameObjectSystem.Stage.SceneLoaded => "listener.scene_loaded",
+			_ => "listener.unknown",
+		};
+		GetCallbacks( stage ).Run( category, PerformanceTailAttribution.Enabled && !IsEditor );
 	}
 
 	Dictionary<GameObjectSystem.Stage, TimedCallbackList> listeners = new Dictionary<GameObjectSystem.Stage, TimedCallbackList>();

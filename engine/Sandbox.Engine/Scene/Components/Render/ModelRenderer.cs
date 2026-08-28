@@ -213,6 +213,8 @@ public partial class ModelRenderer : Renderer, ExecuteInEditor, ITintable, IMate
 
 	internal SceneObject _sceneObject;
 	public SceneObject SceneObject => _sceneObject;
+	SceneModelTransformParentSystem _transformParentSystem;
+	GameObject _transformParentRoot;
 
 	Color ITintable.Color { get => Tint; set => Tint = value; }
 
@@ -277,7 +279,17 @@ public partial class ModelRenderer : Renderer, ExecuteInEditor, ITintable, IMate
 		_sceneObject = new SceneObject( Scene.SceneWorld, model, WorldTransform );
 		OnSceneObjectCreated( _sceneObject );
 
-		Transform.OnTransformChanged += OnTransformChanged;
+		// [ENGINE-VERIFIED via /check-engine 2026-08-27] SceneObject.AddChild is stock native
+		// movement parenting. Explicitly tagged hierarchies move one invisible native anchor rather
+		// than uploading the same root delta through every ordinary ModelRenderer callback.
+		_transformParentSystem = Scene.GetSystem<SceneModelTransformParentSystem>();
+		if ( _transformParentSystem.TryAttach( this, out _transformParentRoot ) )
+			Transform.OnTransformChangedExceptNativeParentRoot += OnParentedTransformChanged;
+		else
+		{
+			_transformParentSystem = null;
+			Transform.OnTransformChanged += OnTransformChanged;
+		}
 	}
 
 	internal override void OnSceneObjectCreated( SceneObject o )
@@ -304,7 +316,17 @@ public partial class ModelRenderer : Renderer, ExecuteInEditor, ITintable, IMate
 		}
 		finally
 		{
-			Transform.OnTransformChanged -= OnTransformChanged;
+			if ( _transformParentRoot is not null )
+			{
+				Transform.OnTransformChangedExceptNativeParentRoot -= OnParentedTransformChanged;
+				_transformParentSystem?.Detach( _transformParentRoot, _sceneObject );
+				_transformParentRoot = null;
+				_transformParentSystem = null;
+			}
+			else
+			{
+				Transform.OnTransformChanged -= OnTransformChanged;
+			}
 
 			BackupRenderAttributes( _sceneObject?.Attributes );
 			_sceneObject?.Delete();
@@ -312,6 +334,15 @@ public partial class ModelRenderer : Renderer, ExecuteInEditor, ITintable, IMate
 		}
 
 		base.OnDisabledInternal();
+	}
+
+	private void OnParentedTransformChanged( GameTransform changeRoot )
+	{
+		// Exact native-root propagation is filtered before delegate dispatch. Intermediate/local motion
+		// (turret yaw, barrel animation, damage displacement) still reaches this child exactly as before.
+		// Keep the root guard as the control arm for scene_model_native_parent_skip_root_callbacks 0.
+		if ( _transformParentRoot.IsValid() && changeRoot == _transformParentRoot.Transform ) return;
+		OnTransformChanged();
 	}
 
 	private void OnTransformChanged()

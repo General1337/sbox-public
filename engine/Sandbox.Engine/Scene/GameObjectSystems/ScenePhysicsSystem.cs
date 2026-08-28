@@ -8,6 +8,17 @@ namespace Sandbox;
 [Expose]
 sealed class ScenePhysicsSystem : GameObjectSystem<ScenePhysicsSystem>
 {
+	static readonly PerformanceStats.Timings GatherEventsTiming = PerformanceStats.Timings.Get( "Physics.GatherEvents" );
+	static readonly PerformanceStats.Timings PreEventsTiming = PerformanceStats.Timings.Get( "Physics.PreEvents" );
+	static readonly PerformanceStats.Timings KeyframesTiming = PerformanceStats.Timings.Get( "Physics.Keyframes" );
+	static readonly PerformanceStats.Timings NativeStepTiming = PerformanceStats.Timings.Get( "Physics.NativeStep" );
+	static readonly PerformanceStats.Timings SyncBodiesTiming = PerformanceStats.Timings.Get( "Physics.SyncBodies" );
+	static readonly PerformanceStats.Timings PostEventsTiming = PerformanceStats.Timings.Get( "Physics.PostEvents" );
+	static readonly PerformanceStats.Timings NativeSubstepsMetric = PerformanceStats.Timings.Get( "Physics.NativeSubsteps" );
+	static readonly PerformanceStats.Timings KeyframeCountMetric = PerformanceStats.Timings.Get( "Physics.KeyframeCount" );
+	static readonly PerformanceStats.Timings SyncBodyCountMetric = PerformanceStats.Timings.Get( "Physics.SyncBodyCount" );
+	static readonly PerformanceStats.Timings SyncAwakeBodyCountMetric = PerformanceStats.Timings.Get( "Physics.SyncAwakeBodyCount" );
+
 	private PhysicsWorld PhysicsWorld;
 	private HashSetEx<Collider> KeyframeColliders { get; set; } = new();
 	private HashSet<Rigidbody> RigidBodies { get; set; } = new();
@@ -66,14 +77,18 @@ sealed class ScenePhysicsSystem : GameObjectSystem<ScenePhysicsSystem>
 		//
 		// Get collision events
 		//
-		CollisionEvents.Clear();
-		Scene.GetAll( CollisionEvents );
+		using ( GatherEventsTiming.Scope() )
+		{
+			CollisionEvents.Clear();
+			Scene.GetAll( CollisionEvents );
+		}
 
 		//
 		// Called before UpdateKeyframeTransform on purpose, because I assume people are going to use this to move
 		// their keyframes, and I want to catch those changes before the physics step.
 		//
-		IScenePhysicsEvents.Post( x => x.PrePhysicsStep() );
+		using ( PreEventsTiming.Scope() )
+			IScenePhysicsEvents.Post( x => x.PrePhysicsStep() );
 
 		//
 		// Tell all the keyframe colliders to "move" their keyframes to their new position
@@ -82,13 +97,24 @@ sealed class ScenePhysicsSystem : GameObjectSystem<ScenePhysicsSystem>
 		//
 		// Box3D doesn't like us threading things
 		// System.Threading.Tasks.Parallel.ForEach( KeyframeColliders.EnumerateLocked( true ), c => c.UpdateKeyframeTransform() );
-		foreach ( var c in KeyframeColliders.EnumerateLocked( true ) )
+		var keyframeCount = 0;
+		using ( KeyframesTiming.Scope() )
 		{
-			c.UpdateKeyframeTransform();
+			foreach ( var c in KeyframeColliders.EnumerateLocked( true ) )
+			{
+				c.UpdateKeyframeTransform();
+				keyframeCount++;
+			}
 		}
+		KeyframeCountMetric.AddMilliseconds( 0, keyframeCount );
 
 		// The actual physics step - if the world was never created there's nothing to step
-		PhysicsWorld?.Step( Time.NowDouble, Time.Delta, steps );
+		if ( PhysicsWorld.IsValid() )
+		{
+			NativeSubstepsMetric.AddMilliseconds( 0, steps * PhysicsWorld.SubSteps );
+			using ( NativeStepTiming.Scope() )
+				PhysicsWorld.Step( Time.NowDouble, Time.Delta, steps );
+		}
 
 		//
 		// Update the positions of the rigidbodies based on the new physics positions
@@ -96,16 +122,27 @@ sealed class ScenePhysicsSystem : GameObjectSystem<ScenePhysicsSystem>
 		//
 		// I don't feel comfortable doing this in a thread, because of all the LocalTransformChanged callbacks
 		// System.Threading.Tasks.Parallel.ForEach( Scene.GetAll<Rigidbody>(), c => c.UpdateTransformFromBody() );
-		foreach ( var obj in Scene.GetAll<Rigidbody>() )
+		var syncedBodies = 0;
+		var awakeBodies = 0;
+		using ( SyncBodiesTiming.Scope() )
 		{
-			obj.UpdateTransformFromBody();
+			foreach ( var obj in Scene.GetAll<Rigidbody>() )
+			{
+				obj.UpdateTransformFromBody();
+				syncedBodies++;
+				var body = obj.PhysicsBody;
+				if ( body.IsValid() && !body.Sleeping ) awakeBodies++;
+			}
 		}
+		SyncBodyCountMetric.AddMilliseconds( 0, syncedBodies );
+		SyncAwakeBodyCountMetric.AddMilliseconds( 0, awakeBodies );
 
 		//
 		// Called after the positions of everything are updated, because I assume that people are going to want
 		// to access those positions and do shit with them.
 		//
-		IScenePhysicsEvents.Post( x => x.PostPhysicsStep() );
+		using ( PostEventsTiming.Scope() )
+			IScenePhysicsEvents.Post( x => x.PostPhysicsStep() );
 	}
 
 	void OnIntersectionStart( PhysicsIntersection o )

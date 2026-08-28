@@ -27,7 +27,7 @@ internal static partial class SyncContext
 		if ( MainThread != null ) return;
 
 		MainThread = new ExpirableSynchronizationContext( false );
-		WorkerThread = new ExpirableSynchronizationContext( true );
+		WorkerThread = new ExpirableSynchronizationContext( true, global::Sandbox.Tasks.WorkerThread.Wake );
 
 		SynchronizationContext.SetSynchronizationContext( MainThread );
 	}
@@ -46,7 +46,7 @@ internal static partial class SyncContext
 
 	private static ExpirableSynchronizationContext Reset( ExpirableSynchronizationContext oldInstance )
 	{
-		var newInstance = new ExpirableSynchronizationContext( oldInstance.WarnNonYieldingTasks );
+		var newInstance = new ExpirableSynchronizationContext( oldInstance.WarnNonYieldingTasks, oldInstance.WorkPosted );
 
 		if ( SynchronizationContext.Current == oldInstance )
 		{

@@ -268,6 +268,10 @@ internal sealed class SpriteBatchSceneObject : SceneCustomObject
 	// Pre-allocated buffer to avoid GC allocations in hot path
 	private SpriteRenderer[] _componentBuffer = new SpriteRenderer[16];
 	private readonly object _boundsLock = new();
+	// [ENGINE-VERIFIED via /check-engine 2026-08-27] The live two-capital menu fixture has three
+	// SpriteRenderer components. EventPipe attributed 1.07 MiB/5 s to the Parallel.For scheduler
+	// below at that population; larger batches keep the existing parallel path.
+	private const int ParallelComponentThreshold = 16;
 
 	public void RegisterSprite( Guid ownerId, SpriteData[] sharedSprites, int offset, int count, int splotCount, BBox bounds )
 	{
@@ -374,94 +378,37 @@ internal sealed class SpriteBatchSceneObject : SceneCustomObject
 				_componentBuffer[index++] = component;
 			}
 
-			object boundsLock = _boundsLock;
-			Parallel.For<(Vector3 mins, Vector3 maxs)>(
-				0, componentCount,
-				() => (new Vector3( float.MaxValue, float.MaxValue, float.MaxValue ),
-					   new Vector3( float.MinValue, float.MinValue, float.MinValue )),
-				( i, _, local ) =>
+			if ( componentCount < ParallelComponentThreshold )
+			{
+				for ( int i = 0; i < componentCount; i++ )
 				{
-					var c = _componentBuffer[i];
-					var transform = c.WorldTransform;
-					var spriteSize = c.Size;
-					var rotation = c.WorldRotation.Angles().AsVector3();
-
-					if ( c.Billboard == SpriteRenderer.BillboardMode.Always || c.Billboard == SpriteRenderer.BillboardMode.YOnly )
-					{
-						// We only care about roll in this case
-						rotation.x = 0;
-						rotation.y = 0;
-					}
-
-					spriteSize = spriteSize.Abs();
-
-					// Adjust for aspect ratio
-					var aspectRatio = (c.Texture?.Width ?? 1) / (float)(c.Texture?.Height ?? 1);
-					var size = spriteSize / 2f;
-					var pos = transform.Position;
-					var scale = new Vector3( transform.Scale.x * size.x, transform.Scale.y, transform.Scale.z * size.y );
-					if ( aspectRatio < 1f )
-						scale *= new Vector3( aspectRatio, 1f, 1f );
-					else
-						scale *= new Vector3( 1f, 1f, 1f / aspectRatio );
-
-					pos = pos.RotateAround( transform.Position, transform.Rotation );
-					transform = transform.WithScale( scale ).WithPosition( pos );
-
-					var renderFlags = SpriteFlags.None;
-					if ( c.FlipHorizontal ) renderFlags |= SpriteFlags.FlipX;
-					if ( c.FlipVertical ) renderFlags |= SpriteFlags.FlipY;
-
-					var rgbe = c.Color.ToRgbe();
-					var alpha = (byte)(c.Color.a.Clamp( 0.0f, 1.0f ) * 255.0f);
-					var tintColor = new Color32( rgbe.r, rgbe.g, rgbe.b, alpha );
-
-					var overlayRgbe = c.OverlayColor.ToRgbe();
-					var overlayAlpha = (byte)(c.OverlayColor.a.Clamp( 0.0f, 1.0f ) * 255.0f);
-					var overlayColor = new Color32( overlayRgbe.r, overlayRgbe.g, overlayRgbe.b, overlayAlpha );
-
-					int lightingFlag = c.Lighting ? 1 : 0;
-					uint packedExponent = (uint)(((byte)lightingFlag) | rgbe.a << 16);
-
-					uint packedFogAndAlpha = SpriteData.PackFogAndAlphaCutout( c.FogStrength, c.AlphaCutoff );
-
-					var spritePos = transform.Position;
-					var spriteScale = new Vector2( transform.Scale.x, transform.Scale.z );
-
-					SpriteDataBuffer[i] = new SpriteData
-					{
-						Position = spritePos,
-						Rotation = new( rotation.x, rotation.y, rotation.z ),
-						Scale = spriteScale,
-						TextureHandle = c.Texture is null ? Texture.Invalid.Index : c.Texture.Index,
-						TintColor = tintColor.RawInt,
-						OverlayColor = overlayColor.RawInt,
-						RenderFlags = (int)renderFlags,
-						BillboardMode = (uint)c.Billboard,
-						FogStrengthCutout = packedFogAndAlpha,
-						Lighting = packedExponent,
-						DepthFeather = c.DepthFeather,
-						SamplerIndex = SamplerState.GetBindlessIndex( sampler with { Filter = c.TextureFilter } ),
-						Offset = c.Pivot
-					};
-
-					var pivot = c.Pivot;
-					float halfSize = MathF.Max(
-						MathF.Max( pivot.x, 1f - pivot.x ) * 2f * spriteScale.x,
-						MathF.Max( pivot.y, 1f - pivot.y ) * 2f * spriteScale.y
-					);
-					var expand = new Vector3( halfSize, halfSize, halfSize );
-					return (Vector3.Min( local.mins, spritePos - expand ), Vector3.Max( local.maxs, spritePos + expand ));
-				},
-				local =>
-				{
-					lock ( boundsLock )
-					{
-						boundsMin = Vector3.Min( boundsMin, local.mins );
-						boundsMax = Vector3.Max( boundsMax, local.maxs );
-					}
+					var local = PopulateComponentSprite( i );
+					boundsMin = Vector3.Min( boundsMin, local.mins );
+					boundsMax = Vector3.Max( boundsMax, local.maxs );
 				}
-			);
+			}
+			else
+			{
+				object boundsLock = _boundsLock;
+				Parallel.For<(Vector3 mins, Vector3 maxs)>(
+					0, componentCount,
+					() => (new Vector3( float.MaxValue, float.MaxValue, float.MaxValue ),
+						   new Vector3( float.MinValue, float.MinValue, float.MinValue )),
+					( i, _, local ) =>
+					{
+						var item = PopulateComponentSprite( i );
+						return (Vector3.Min( local.mins, item.mins ), Vector3.Max( local.maxs, item.maxs ));
+					},
+					local =>
+					{
+						lock ( boundsLock )
+						{
+							boundsMin = Vector3.Min( boundsMin, local.mins );
+							boundsMax = Vector3.Max( boundsMax, local.maxs );
+						}
+					}
+				);
+			}
 
 		}
 
@@ -478,6 +425,73 @@ internal sealed class SpriteBatchSceneObject : SceneCustomObject
 		GPUUploadQueued = false;
 
 		BuildCommandList( spriteCount, splotCount, componentCount );
+	}
+
+	private (Vector3 mins, Vector3 maxs) PopulateComponentSprite( int i )
+	{
+		var c = _componentBuffer[i];
+		var transform = c.WorldTransform;
+		var spriteSize = c.Size;
+		var rotation = c.WorldRotation.Angles().AsVector3();
+
+		if ( c.Billboard == SpriteRenderer.BillboardMode.Always || c.Billboard == SpriteRenderer.BillboardMode.YOnly )
+		{
+			rotation.x = 0;
+			rotation.y = 0;
+		}
+
+		spriteSize = spriteSize.Abs();
+		var aspectRatio = (c.Texture?.Width ?? 1) / (float)(c.Texture?.Height ?? 1);
+		var size = spriteSize / 2f;
+		var pos = transform.Position;
+		var scale = new Vector3( transform.Scale.x * size.x, transform.Scale.y, transform.Scale.z * size.y );
+		if ( aspectRatio < 1f )
+			scale *= new Vector3( aspectRatio, 1f, 1f );
+		else
+			scale *= new Vector3( 1f, 1f, 1f / aspectRatio );
+
+		pos = pos.RotateAround( transform.Position, transform.Rotation );
+		transform = transform.WithScale( scale ).WithPosition( pos );
+
+		var renderFlags = SpriteFlags.None;
+		if ( c.FlipHorizontal ) renderFlags |= SpriteFlags.FlipX;
+		if ( c.FlipVertical ) renderFlags |= SpriteFlags.FlipY;
+
+		var rgbe = c.Color.ToRgbe();
+		var alpha = (byte)(c.Color.a.Clamp( 0.0f, 1.0f ) * 255.0f);
+		var tintColor = new Color32( rgbe.r, rgbe.g, rgbe.b, alpha );
+		var overlayRgbe = c.OverlayColor.ToRgbe();
+		var overlayAlpha = (byte)(c.OverlayColor.a.Clamp( 0.0f, 1.0f ) * 255.0f);
+		var overlayColor = new Color32( overlayRgbe.r, overlayRgbe.g, overlayRgbe.b, overlayAlpha );
+		int lightingFlag = c.Lighting ? 1 : 0;
+		uint packedExponent = (uint)(((byte)lightingFlag) | rgbe.a << 16);
+		uint packedFogAndAlpha = SpriteData.PackFogAndAlphaCutout( c.FogStrength, c.AlphaCutoff );
+		var spritePos = transform.Position;
+		var spriteScale = new Vector2( transform.Scale.x, transform.Scale.z );
+
+		SpriteDataBuffer[i] = new SpriteData
+		{
+			Position = spritePos,
+			Rotation = new( rotation.x, rotation.y, rotation.z ),
+			Scale = spriteScale,
+			TextureHandle = c.Texture is null ? Texture.Invalid.Index : c.Texture.Index,
+			TintColor = tintColor.RawInt,
+			OverlayColor = overlayColor.RawInt,
+			RenderFlags = (int)renderFlags,
+			BillboardMode = (uint)c.Billboard,
+			FogStrengthCutout = packedFogAndAlpha,
+			Lighting = packedExponent,
+			DepthFeather = c.DepthFeather,
+			SamplerIndex = SamplerState.GetBindlessIndex( sampler with { Filter = c.TextureFilter } ),
+			Offset = c.Pivot
+		};
+
+		var pivot = c.Pivot;
+		float halfSize = MathF.Max(
+			MathF.Max( pivot.x, 1f - pivot.x ) * 2f * spriteScale.x,
+			MathF.Max( pivot.y, 1f - pivot.y ) * 2f * spriteScale.y );
+		var expand = new Vector3( halfSize, halfSize, halfSize );
+		return (spritePos - expand, spritePos + expand);
 	}
 
 	private const int GroupSize = 256;

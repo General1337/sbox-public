@@ -70,6 +70,16 @@ public static partial class PerformanceStats
 	public static ulong ApproximateProcessMemoryUsage { get; internal set; }
 
 	/// <summary>
+	/// CPU time consumed by the whole editor process between the previous two frame boundaries, in
+	/// milliseconds. Unlike the main-thread timing rows, this includes render, physics, audio,
+	/// networking and worker threads; it can legitimately exceed wall-clock frame time on many cores.
+	/// </summary>
+	public static double ProcessCpuTimeMs { get; internal set; }
+
+	/// <summary>Logical CPU count, exposed through the engine so sandboxed game reports need no System.Environment access.</summary>
+	public static int LogicalProcessorCount => Environment.ProcessorCount;
+
+	/// <summary>
 	/// Performance statistics over the last period, which is dictated by "perf_time" console command.
 	/// </summary>
 	public static Block LastSecond { get; internal set; }
@@ -81,6 +91,8 @@ public static partial class PerformanceStats
 	private static long _prevPauseTime;
 	private static int _prevGen0, _prevGen1, _prevGen2;
 	private static int _exceptions;
+	private static readonly Process CurrentProcess = Process.GetCurrentProcess();
+	private static TimeSpan _prevProcessCpuTime;
 	private static int _lastSecond; // the actual rounded second of RealTime.Now when we last captured
 
 	internal static bool Frame()
@@ -120,6 +132,10 @@ public static partial class PerformanceStats
 		_prevGen2 = gen2;
 
 		PerformanceStats.ApproximateProcessMemoryUsage = NativeEngine.EngineGlue.ApproximateProcessMemoryUsage();
+
+		var processCpuTime = CurrentProcess.TotalProcessorTime;
+		ProcessCpuTimeMs = Math.Max( 0.0, (processCpuTime - _prevProcessCpuTime).TotalMilliseconds );
+		_prevProcessCpuTime = processCpuTime;
 
 		Timings.FlipAll();
 

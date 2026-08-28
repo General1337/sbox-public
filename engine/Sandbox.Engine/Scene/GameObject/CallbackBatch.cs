@@ -11,6 +11,13 @@ namespace Sandbox;
 /// </summary>
 class CallbackBatch : System.IDisposable
 {
+	// Dense pooled VFX frequently nests Isolated clone/enable batches well past depth two. Keeping
+	// only two instances meant every deeper scope rebuilt its callback dictionary and grew each
+	// ActionTarget list from zero, exactly the List<T>.AddWithResize allocation seen in battle
+	// traces. Retain a bounded nesting set; Clear() below preserves the learned capacities.
+	const int MaxPooledBatches = 64;
+	const int InitialActionCapacity = 16;
+
 	static CallbackBatch Current { get; set; }
 	static Stack<CallbackBatch> Pool = new();
 
@@ -26,11 +33,12 @@ class CallbackBatch : System.IDisposable
 	/// <summary>
 	/// Pre-sorted CommonCallback values used in Execute() to avoid per-call LINQ OrderBy allocation.
 	/// </summary>
-	static readonly CommonCallback[] SortedCallbacks = Enum.GetValues<CommonCallback>().OrderBy( x => (int)x ).ToArray();
+	static readonly CommonCallback[] SortedCallbacks = ((CommonCallback[])Enum.GetValues( typeof( CommonCallback ) ))
+		.OrderBy( x => (int)x ).ToArray();
 
 	class Group
 	{
-		List<ActionTarget> Actions = new List<ActionTarget>();
+		List<ActionTarget> Actions = new List<ActionTarget>( InitialActionCapacity );
 
 		public void Clear()
 		{
@@ -203,7 +211,7 @@ class CallbackBatch : System.IDisposable
 
 		Execute();
 
-		if ( Pool.Count < 2 )
+		if ( Pool.Count < MaxPooledBatches )
 		{
 			_previous = default;
 			Pool.Push( this );

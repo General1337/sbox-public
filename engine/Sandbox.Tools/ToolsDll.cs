@@ -10,6 +10,12 @@ internal class ToolsDll : IToolsDll
 {
 	static Logger log = new Logger( "ToolsDll" );
 
+	[ConVar( "tools_play_frame_hz", Help =
+		"Managed editor/tool frame rate while the game is playing. 30 keeps the editor responsive without charging every rendered game frame; 0 runs every frame." )]
+	public static float PlayModeToolsFrameRate { get; set; } = 30f;
+
+	static long _nextPlayModeToolsFrame;
+
 	PackageLoader.Enroller AssemblyEnroller { get; set; }
 
 	public ToolsDll()
@@ -62,7 +68,9 @@ internal class ToolsDll : IToolsDll
 	/// </summary>
 	public void OnRender()
 	{
+		var tail = Sandbox.Diagnostics.PerformanceTailAttribution.Begin();
 		SceneRenderingWidget.RenderAll();
+		Sandbox.Diagnostics.PerformanceTailAttribution.End( tail, "editor.output", "SceneRenderingWidget.RenderAll" );
 	}
 
 	public bool ConsoleFocus()
@@ -318,10 +326,37 @@ internal class ToolsDll : IToolsDll
 	{
 		using ( Sandbox.Diagnostics.PerformanceStats.Timings.Editor.Scope() )
 		{
-			g_pToolFramework2.Tools_RunFrame();
+			if ( ShouldRunToolsFrame() )
+			{
+				var runFrameTail = Sandbox.Diagnostics.PerformanceTailAttribution.Begin();
+				g_pToolFramework2.Tools_RunFrame();
+				Sandbox.Diagnostics.PerformanceTailAttribution.End( runFrameTail, "editor.tools.native", "Tools_RunFrame" );
+			}
+
+			var idleTail = Sandbox.Diagnostics.PerformanceTailAttribution.Begin();
 			g_pToolFramework2.Tools_OnIdle( 0 );
+			Sandbox.Diagnostics.PerformanceTailAttribution.End( idleTail, "editor.tools.native", "Tools_OnIdle" );
+
+			var unloadTail = Sandbox.Diagnostics.PerformanceTailAttribution.Begin();
 			g_pToolFramework2.Tools_UnloadPending();
+			Sandbox.Diagnostics.PerformanceTailAttribution.End( unloadTail, "editor.tools.native", "Tools_UnloadPending" );
 		}
+	}
+
+	static bool ShouldRunToolsFrame()
+	{
+		var hz = PlayModeToolsFrameRate;
+		if ( !Game.IsPlaying || hz <= 0f )
+		{
+			_nextPlayModeToolsFrame = 0;
+			return true;
+		}
+
+		var now = System.Diagnostics.Stopwatch.GetTimestamp();
+		if ( now < _nextPlayModeToolsFrame ) return false;
+		var interval = (long)(System.Diagnostics.Stopwatch.Frequency / Math.Clamp( hz, 1f, 120f ));
+		_nextPlayModeToolsFrame = now + Math.Max( 1L, interval );
+		return true;
 	}
 
 	/// <summary>

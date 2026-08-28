@@ -9,6 +9,7 @@ internal static class WorkerThread
 {
 	private static Task[] _sWorkerTasks;
 	private static CancellationTokenSource _sCts;
+	private static SemaphoreSlim _sWake;
 
 	public static bool HasStarted => _sWorkerTasks != null;
 
@@ -33,29 +34,44 @@ internal static class WorkerThread
 
 		_sWorkerTasks = new Task[workerThreads];
 		_sCts = new CancellationTokenSource();
+		_sWake = new SemaphoreSlim( 0, int.MaxValue );
 
 		for ( var i = 0; i < workerThreads; i++ )
 		{
 			_sWorkerTasks[i] = Task.Run( WorkerTask );
 		}
+
+		if ( SyncContext.WorkerThread.QueueCount > 0 ) Wake();
+	}
+
+	/// <summary>Wake one worker after a continuation is posted. This replaces the permanent 1 ms
+	/// timer poll; it is safe before start and during stop/reset.</summary>
+	internal static void Wake()
+	{
+		var wake = _sWake;
+		if ( wake is null ) return;
+		try { wake.Release(); }
+		catch ( ObjectDisposedException ) { }
+		catch ( SemaphoreFullException ) { }
 	}
 
 	private static async Task WorkerTask()
 	{
 		var ct = _sCts.Token;
+		var wake = _sWake;
 
 		while ( !ct.IsCancellationRequested )
 		{
-			SyncContext.WorkerThread.ProcessQueue();
-
 			try
 			{
-				await Task.Delay( 1, ct );
+				await wake.WaitAsync( ct );
 			}
 			catch ( OperationCanceledException )
 			{
 				return;
 			}
+
+			SyncContext.WorkerThread.ProcessQueue();
 		}
 	}
 
@@ -81,6 +97,9 @@ internal static class WorkerThread
 		}
 
 		_sWorkerTasks = null;
+		_sCts.Dispose();
 		_sCts = null;
+		_sWake.Dispose();
+		_sWake = null;
 	}
 }

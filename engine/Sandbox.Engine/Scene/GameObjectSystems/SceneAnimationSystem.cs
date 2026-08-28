@@ -33,6 +33,11 @@ public sealed class SceneAnimationSystem : GameObjectSystem<SceneAnimationSystem
 	private readonly List<SkinnedModelRenderer> _rootRenderers = new();
 	private readonly List<SkinnedModelRenderer> _boneMergeRoots = new();
 	private readonly List<SkinnedModelRenderer> _physRenderers = new();
+	// [ENGINE-VERIFIED via /check-engine 2026-08-27] The live two-capital menu fixture has six
+	// skinned renderers. EventPipe attributed 2.99 MiB/5 s to Parallel.ForEach's TaskReplicator
+	// in UpdateAnimation at that population, so retain parallelism only when there is enough
+	// independent renderer work to amortize the scheduler.
+	private const int ParallelRendererThreshold = 8;
 
 	private static int _animThreadCount = Math.Max( 1, Environment.ProcessorCount - 1 );
 
@@ -79,7 +84,15 @@ public sealed class SceneAnimationSystem : GameObjectSystem<SceneAnimationSystem
 			// and their bones haven't been worked out yet. They will get worked out after our parent is.
 			// Use a load-balanced partitioner: work per root is highly uneven (clothed characters have many
 			// bone-merged children), so static range partitioning would cause severe thread idle time.
-			System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _rootRenderers, loadBalance: true ), _animParallelOptions, ProcessRenderer );
+			if ( _rootRenderers.Count < ParallelRendererThreshold )
+			{
+				foreach ( var renderer in _rootRenderers )
+					ProcessRenderer( renderer );
+			}
+			else
+			{
+				System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _rootRenderers, loadBalance: true ), _animParallelOptions, ProcessRenderer );
+			}
 
 			// This is a good time to maintain decode caches
 			// Will copy local caches to the global cache and handle LRU eviction
@@ -87,7 +100,15 @@ public sealed class SceneAnimationSystem : GameObjectSystem<SceneAnimationSystem
 			Task.Run( g_pAnimationSystemUtils.MaintainDecodeCaches );
 
 			// Now merge any descendants without allocating per-merge delegates
-			System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _boneMergeRoots, loadBalance: true ), _animParallelOptions, renderer => renderer.MergeDescendants( ChangedTransforms ) );
+			if ( _boneMergeRoots.Count < ParallelRendererThreshold )
+			{
+				foreach ( var renderer in _boneMergeRoots )
+					renderer.MergeDescendants( ChangedTransforms );
+			}
+			else
+			{
+				System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _boneMergeRoots, loadBalance: true ), _animParallelOptions, renderer => renderer.MergeDescendants( ChangedTransforms ) );
+			}
 
 			while ( ChangedTransforms.TryDequeue( out var tx ) )
 			{
@@ -142,6 +163,14 @@ public sealed class SceneAnimationSystem : GameObjectSystem<SceneAnimationSystem
 				_physRenderers.Add( renderer );
 		}
 
-		System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _physRenderers, loadBalance: true ), _animParallelOptions, renderer => renderer.Physics.Step() );
+		if ( _physRenderers.Count < ParallelRendererThreshold )
+		{
+			foreach ( var renderer in _physRenderers )
+				renderer.Physics.Step();
+		}
+		else
+		{
+			System.Threading.Tasks.Parallel.ForEach( Partitioner.Create( _physRenderers, loadBalance: true ), _animParallelOptions, renderer => renderer.Physics.Step() );
+		}
 	}
 }
