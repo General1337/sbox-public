@@ -73,34 +73,98 @@ class ClutterGenerationJob
 	public BBox? LocalBounds { get; init; }
 	public Transform? VolumeTransform { get; init; }
 
+	private bool _started;
+	private bool _completed;
+	private bool _completeNotified;
+	private int _resolvedSeed;
+	private TerrainMaterialScatterer.TerrainMaterialScatterWork _terrainMaterialWork;
+	private int _reportedPoints;
+
 	/// <summary>
 	/// Execute the generation job.
 	/// </summary>
 	public void Execute()
 	{
+		ExecuteBudgeted( long.MaxValue );
+	}
+
+	/// <summary>
+	/// Executes the exact job until completion or a Stopwatch deadline. Only infinite
+	/// TerrainMaterialScatterer jobs are resumable; every other job retains the legacy call.
+	/// </summary>
+	public bool ExecuteBudgeted( long deadlineTimestamp )
+	{
+		if ( _completed ) return true;
+
 		try
 		{
 			if ( !Parent.IsValid() )
-				return;
-
-			int seed = Seed;
-			if ( Tile != null )
 			{
-				Tile.Destroy();
-				Layer?.ClearTileModelInstances( Tile.Coordinates );
+				_completed = true;
+				return true;
+			}
 
-				seed = Scatterer.GenerateSeed( Tile.SeedOffset, Tile.Coordinates.x, Tile.Coordinates.y );
+			BeginGeneration();
+			if ( _terrainMaterialWork != null )
+			{
+				var complete = _terrainMaterialWork.ExecuteUntil( deadlineTimestamp );
+				var processed = _terrainMaterialWork.PointsProcessed;
+				ClutterGridSystem.s_pointsProcessed += processed - _reportedPoints;
+				_reportedPoints = processed;
+				if ( !complete ) return false;
+				FinishGeneration( _terrainMaterialWork.Instances );
+				return true;
 			}
 
 			var instances = Clutter.Scatterer.HasValue
-				? Clutter.Scatterer.Value.Scatter( Bounds, Clutter, seed, Parent.Scene )
+				? Clutter.Scatterer.Value.Scatter( Bounds, Clutter, _resolvedSeed, Parent.Scene )
 				: null;
+			FinishGeneration( instances );
+			return true;
+		}
+		catch
+		{
+			_completed = true;
+			throw;
+		}
+		finally
+		{
+			if ( _completed && !_completeNotified )
+			{
+				_completeNotified = true;
+				OnComplete?.Invoke();
+			}
+		}
+	}
+
+	private void BeginGeneration()
+	{
+		if ( _started ) return;
+		_started = true;
+		_resolvedSeed = Seed;
+		if ( Tile != null )
+			_resolvedSeed = Scatterer.GenerateSeed( Tile.SeedOffset, Tile.Coordinates.x, Tile.Coordinates.y );
+
+		if ( Tile != null && !LocalBounds.HasValue && !VolumeTransform.HasValue &&
+			Clutter.Scatterer.HasValue && Clutter.Scatterer.Value is TerrainMaterialScatterer terrain )
+			_terrainMaterialWork = terrain.CreateStreamingWork( Bounds, Clutter, _resolvedSeed, Parent.Scene );
+	}
+
+	private void FinishGeneration( List<ClutterInstance> instances )
+	{
+		if ( _completed ) return;
 
 			if ( LocalBounds.HasValue && VolumeTransform.HasValue )
 			{
 				var volumeTransform = VolumeTransform.Value;
 				var localBounds = LocalBounds.Value;
 				instances?.RemoveAll( i => !localBounds.Contains( volumeTransform.PointToLocal( i.Transform.Position ) ) );
+			}
+
+			if ( Tile != null )
+			{
+				Tile.Destroy();
+				Layer?.ClearTileModelInstances( Tile.Coordinates );
 			}
 
 			if ( instances is { Count: > 0 } )
@@ -113,12 +177,10 @@ class ClutterGenerationJob
 			{
 				Tile.IsPopulated = true;
 				Layer?.OnTilePopulated( Tile );
+				ClutterGridSystem.s_tilesCompleted++;
 			}
-		}
-		finally
-		{
-			OnComplete?.Invoke();
-		}
+
+			_completed = true;
 	}
 
 	private static void ApplyEntryLocalScale( List<ClutterInstance> instances )

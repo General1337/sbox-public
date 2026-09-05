@@ -2,6 +2,7 @@
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Emit;
 using System.Collections.Immutable;
+using System.IO;
 using System.Threading;
 
 namespace Sandbox;
@@ -41,17 +42,16 @@ partial class Compiler
 	/// </summary>
 	internal void UpdateFromAssembly( byte[] bytes )
 	{
-		using ( var a_stream = new System.IO.MemoryStream( bytes ) )
-		{
-			MetadataReference = Microsoft.CodeAnalysis.MetadataReference.CreateFromStream( a_stream );
-		}
+		var compileReference = CompileReference.FromBytes( bytes );
+		MetadataReference = compileReference.Metadata;
 
 		var version = Interlocked.Increment( ref compileCounter );
 		Output = new CompilerOutput( this )
 		{
 			Successful = true,
 			Version = Version.Parse( $"0.0.{version}.0" ),
-			MetadataReference = MetadataReference
+			MetadataReference = MetadataReference,
+			CompileReference = compileReference
 		};
 	}
 
@@ -77,8 +77,10 @@ partial class Compiler
 		Assert.True( IsBuilding, $"{nameof( PreBuild )} must be called first" );
 
 		log.Trace( "Build Start" );
+		using var totalTrace = CompileTrace.Begin( "compiler.total", Name, Group.Name );
 
 		var output = new CompilerOutput( this );
+		output.AssemblyCachePublicationAllowed = !Group.AllowFastHotload || !incrementalState.HasState;
 
 		Interlocked.Increment( ref compileCounter );
 
@@ -88,29 +90,107 @@ partial class Compiler
 		{
 			// Do the expensive archive building on a worker thread
 
-			var archive = await Task.Run( () => BuildArchive( output ) );
+			CodeArchive archive;
+			using ( var stage = CompileTrace.Begin( "compiler.archive", Name, Group.Name ) )
+			{
+				archive = await Task.Run( () => BuildArchive( output ) );
+				stage.Complete( "success", $"syntaxTrees={archive.SyntaxTrees.Count};additionalFiles={archive.AdditionalFiles.Count}" );
+			}
 
 			// Build a list of references, waiting for other compilers to finish if needed
 
-			var refs = await BuildReferencesAsync( archive );
+			IReadOnlyList<CompileReference> refs;
+			using ( var stage = CompileTrace.Begin( "compiler.references", Name, Group.Name ) )
+			{
+				refs = await BuildReferencesAsync( archive );
+				stage.Complete( "success", $"resolved={refs.Count};declared={archive.References.Count}" );
+			}
+
+			if ( AssemblyCacheSettings is { Mode: not CompilerAssemblyCacheMode.Off } cacheSettings )
+			{
+				using var stage = CompileTrace.Begin( "compiler.cache_lookup", Name, Group.Name, cacheMode: cacheSettings.Mode.ToString().ToLowerInvariant() );
+				output.AssemblyCacheKey = await Task.Run( () => CompilerAssemblyCache.CreateLookupKey( this, archive, refs ) );
+				var lookup = cacheSettings.Mode == CompilerAssemblyCacheMode.Miss
+					? (Hit: false, Generation: (CachedCompilerGeneration)null, Decision: "forced-miss")
+					: await Task.Run( () =>
+					{
+						var hit = CompilerAssemblyCache.TryRead( this, output.AssemblyCacheKey, out var generation, out var readDecision );
+						return (Hit: hit, Generation: generation, Decision: readDecision);
+					} );
+				var cached = lookup.Generation;
+				var decision = lookup.Decision;
+				var cacheHit = lookup.Hit;
+				if ( cacheHit )
+				{
+					var validationOutput = new CompilerOutput( this ) { Version = output.Version };
+					var currentArchive = await Task.Run( () => BuildArchive( validationOutput ) );
+					var currentRefs = await BuildReferencesAsync( currentArchive );
+					var currentKey = await Task.Run( () => CompilerAssemblyCache.CreateLookupKey( this, currentArchive, currentRefs ) );
+					if ( currentKey == output.AssemblyCacheKey && TryHydrateAssemblyCache( output, cached ) )
+					{
+						stage.Complete( "hit", $"key={output.AssemblyCacheKey}" );
+						return;
+					}
+					decision = "miss-revalidation";
+				}
+				else if ( cacheSettings.Mode == CompilerAssemblyCacheMode.Miss ) decision = "forced-miss";
+				stage.Complete( "miss", $"decision={decision};key={output.AssemblyCacheKey}" );
+			}
 
 			// Actually compile, again on a worker thread since it's expensive
 
-			await Task.Run( () => BuildInternal( refs, output ) );
+			using ( var stage = CompileTrace.Begin( "compiler.build_internal", Name, Group.Name ) )
+			{
+				await Task.Run( () => BuildInternal( refs.Select( x => x.Metadata ).ToArray(), output ) );
+				stage.Complete( output.Successful ? "success" : "failed", $"diagnostics={output.Diagnostics.Count}" );
+			}
 		}
 		catch ( System.Exception e )
 		{
 			output.Exception = e;
+			totalTrace.Complete( "exception", $"{e.GetType().Name}: {e.Message}" );
 			log.Warning( e, e.Message );
 		}
 		finally
 		{
+			if ( output.Exception is null )
+				totalTrace.Complete( output.Successful ? "success" : "failed", $"diagnostics={output.Diagnostics.Count}" );
+
 			Output = output;
 
 			_compileTcs.SetResult( output );
 
 			log.Trace( "Build Finished" );
 		}
+	}
+
+	internal bool TryHydrateAssemblyCache( CompilerOutput output, CachedCompilerGeneration cached )
+	{
+		try
+		{
+			if ( _config.Whitelist )
+			{
+				if ( Group.AccessControl is null ) return false;
+				using var input = new MemoryStream( cached.AssemblyData, false );
+				var result = Group.AccessControl.VerifyAssembly( input, out TrustedBinaryStream trusted );
+				trusted?.Dispose();
+				if ( !result.Success ) return false;
+			}
+
+			var compileReference = CompileReference.FromBytes( cached.AssemblyData );
+			MetadataReference = output.MetadataReference = compileReference.Metadata;
+			output.CompileReference = compileReference;
+			output.Successful = true;
+			output.AssemblyData = cached.AssemblyData;
+			output.Archive = cached.Archive;
+			output.XmlDocumentation = cached.XmlDocumentation;
+			output.PackageAssetDependencies = cached.PackageAssets;
+			output.LoadedFromAssemblyCache = true;
+			_recentMetadataReferences.Clear();
+			_recentMetadataReferences[output.Version] = output.MetadataReference;
+			return true;
+		}
+		catch { return false; }
 	}
 
 	void CopyReferencesFromArchive( CodeArchive a )
@@ -183,11 +263,16 @@ partial class Compiler
 
 		CSharpCompilation compiler;
 
-		List<SyntaxTree> inputSyntaxTrees =
-		[
-			.. archive.SyntaxTrees, // from source files
-			.. ProcessRazorFiles(archive, output) // processed razor files
-		];
+		List<SyntaxTree> inputSyntaxTrees;
+		using ( var stage = CompileTrace.Begin( "compiler.prepare", Name, Group.Name ) )
+		{
+			inputSyntaxTrees =
+			[
+				.. archive.SyntaxTrees, // from source files
+				.. ProcessRazorFiles(archive, output) // processed razor files
+			];
+			stage.Complete( "success", $"syntaxTrees={inputSyntaxTrees.Count};references={refs.Count}" );
+		}
 
 		List<SyntaxTree> modifiedSyntaxTrees;
 		if ( incrementalState.HasState )
@@ -213,6 +298,7 @@ partial class Compiler
 
 		bool ilHotloadSupported;
 
+		using ( var stage = CompileTrace.Begin( "compiler.generators", Name, Group.Name ) )
 		{
 			var processor = RunGenerators( compiler, modifiedSyntaxTrees, output );
 
@@ -223,8 +309,11 @@ partial class Compiler
 			// If you have any errors in codegen don't bother compiling, developer should sort it out
 			if ( processor.Diagnostics.Any( x => x.Severity == DiagnosticSeverity.Error ) )
 			{
+				stage.Complete( "failed", $"diagnostics={processor.Diagnostics.Count()}" );
 				return;
 			}
+
+			stage.Complete( "success", $"diagnostics={processor.Diagnostics.Count()}" );
 		}
 
 		// check for blacklisted methods/types used in compilation
@@ -232,13 +321,22 @@ partial class Compiler
 		// run this after generators because they can contain user inputs too
 		if ( _config.Whitelist )
 		{
+			using var stage = CompileTrace.Begin( "compiler.whitelist", Name, Group.Name );
 			RunBlacklistWalker( compiler, modifiedSyntaxTrees, output );
 
 			// Errors, fail
-			if ( output.Diagnostics.Any( x => x.Severity == DiagnosticSeverity.Error ) )
+			var whitelistErrors = output.Diagnostics.Count( x => x.Severity == DiagnosticSeverity.Error );
+			if ( whitelistErrors > 0 )
 			{
+				stage.Complete( "failed", $"errors={whitelistErrors}" );
 				return;
 			}
+
+			stage.Complete( "success", "errors=0" );
+		}
+		else
+		{
+			CompileTrace.Emit( "compiler.whitelist", 0, "skipped", Name, Group.Name, detail: "disabled" );
 		}
 
 		using ( var xmlStream = new System.IO.MemoryStream() )
@@ -247,7 +345,11 @@ partial class Compiler
 			var emitOptions = new EmitOptions()
 				.WithDebugInformationFormat( DebugInformationFormat.Embedded );
 
-			BuildResult = compiler.Emit( peStream: peStream, xmlDocumentationStream: xmlStream, options: emitOptions );
+			using ( var stage = CompileTrace.Begin( "compiler.emit", Name, Group.Name ) )
+			{
+				BuildResult = compiler.Emit( peStream: peStream, xmlDocumentationStream: xmlStream, options: emitOptions );
+				stage.Complete( BuildResult.Success ? "success" : "failed", $"diagnostics={BuildResult.Diagnostics.Length}" );
+			}
 
 			if ( BuildResult.Success )
 			{
@@ -257,9 +359,11 @@ partial class Compiler
 
 				if ( _config.Whitelist && Group.AccessControl is { } access )
 				{
+					using var stage = CompileTrace.Begin( "compiler.access_verify", Name, Group.Name );
 					var result = access.VerifyAssembly( peStream, out TrustedBinaryStream stream );
 					if ( !result.Success )
 					{
+						stage.Complete( "failed", $"violations={result.WhitelistErrors.Count}" );
 						log.Error( "Whitelist violation(s), build unsuccessful." );
 
 						output.Successful = false;
@@ -272,8 +376,20 @@ partial class Compiler
 							}
 						}
 					}
+					else
+					{
+						stage.Complete( "success", "violations=0" );
+					}
 					stream?.Dispose();
 				}
+				else
+				{
+					CompileTrace.Emit( "compiler.access_verify", 0, "skipped", Name, Group.Name, detail: "not-required" );
+				}
+			}
+			else
+			{
+				CompileTrace.Emit( "compiler.access_verify", 0, "skipped", Name, Group.Name, detail: "emit-failed" );
 			}
 
 			output.AssemblyData = peStream.ToArray();
@@ -287,14 +403,22 @@ partial class Compiler
 			return;
 		}
 
-		incrementalState.Update( archive, inputSyntaxTrees, compiler );
-
-		using ( var a_stream = new System.IO.MemoryStream( output.AssemblyData ) )
+		using ( var stage = CompileTrace.Begin( "compiler.incremental_state", Name, Group.Name ) )
 		{
-			MetadataReference = output.MetadataReference = Microsoft.CodeAnalysis.MetadataReference.CreateFromStream( a_stream );
+			incrementalState.Update( archive, inputSyntaxTrees, compiler );
+			stage.Complete( "success" );
+		}
+
+		using ( var stage = CompileTrace.Begin( "compiler.metadata_reference", Name, Group.Name ) )
+		{
+			var compileReference = CompileReference.FromBytes( output.AssemblyData );
+			MetadataReference = output.MetadataReference = compileReference.Metadata;
+			output.CompileReference = compileReference;
 
 			if ( MetadataReference == null )
 				throw new System.Exception( "metaRef is null!" );
+
+			stage.Complete( "success", $"assemblyBytes={output.AssemblyData.Length}" );
 		}
 
 		if ( !ilHotloadSupported )

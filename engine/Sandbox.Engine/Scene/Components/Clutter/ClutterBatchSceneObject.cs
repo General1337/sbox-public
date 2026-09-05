@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Sandbox.Rendering;
 
@@ -85,22 +86,73 @@ internal class ClutterBatchSceneObject : SceneCustomObject
 		if ( _count == 0 )
 			return;
 
-		EnsureCapacity( _count );
+		EnsureCapacity( _count, exact: true );
+		UploadTransformRange( transforms, 0, _count, replaceBounds: true );
+		BuildCommandList();
+	}
+
+	/// <summary>
+	/// Appends or replaces the tail beginning at <paramref name="uploadStart"/>. Capacity growth
+	/// performs one exact full upload; stable capacity uploads only the new range.
+	/// </summary>
+	internal int UpdateInstancesIncremental( List<Transform> transforms, int uploadStart )
+	{
+		if ( uploadStart < 0 || uploadStart > transforms.Count )
+			return -1;
+
+		var oldCount = _count;
+		_count = transforms.Count;
+		if ( _count == 0 )
+		{
+			BuildCommandList();
+			return 0;
+		}
+
+		var grew = EnsureCapacity( _count, exact: false );
+		var start = grew ? 0 : uploadStart;
+		var count = _count - start;
+		if ( count > 0 ) UploadTransformRange( transforms, start, count, replaceBounds: start == 0 );
+		if ( oldCount != _count || grew ) BuildCommandList();
+		return count;
+	}
+
+	/// <summary>
+	/// Makes a removed slot range non-renderable without moving any surviving slot. The cull shader
+	/// rejects the negative-radius sentinel before fetching/appending its transform.
+	/// </summary>
+	internal bool MarkInactive( int start, int count )
+	{
+		if ( count <= 0 ) return true;
+		if (_instances == null || start < 0 || start + count > _count ) return false;
+
+		using var pooledInstances = new PooledSpan<GpuInstanceTransform>( count );
+		using var pooledSpheres = new PooledSpan<Vector4>( count );
+		var instances = pooledInstances.Span;
+		var spheres = pooledSpheres.Span;
+		instances.Clear();
+		for ( int i = 0; i < count; i++ ) spheres[i] = new Vector4( 0f, 0f, 0f, -1f );
+		_instances.SetData<GpuInstanceTransform>( instances, start );
+		_spheres.SetData<Vector4>( spheres, start );
+		return true;
+	}
+
+	private void UploadTransformRange( List<Transform> transforms, int start, int count, bool replaceBounds )
+	{
+		if ( count <= 0 ) return;
 
 		var modelBounds = _model.Bounds;
 		var modelCenter = modelBounds.Center;
-		var worldBounds = modelBounds.Transform( transforms[0] );
+		var worldBounds = modelBounds.Transform( transforms[start] );
 
-		// Pooled - a real instance set puts both of these in the LOH, and this reruns on every rebuild.
-		using var pooledInstances = new PooledSpan<GpuInstanceTransform>( _count );
-		using var pooledSpheres = new PooledSpan<Vector4>( _count );
+		using var pooledInstances = new PooledSpan<GpuInstanceTransform>( count );
+		using var pooledSpheres = new PooledSpan<Vector4>( count );
 
 		var instances = pooledInstances.Span;
 		var spheres = pooledSpheres.Span;
 
-		for ( int i = 0; i < _count; i++ )
+		for ( int i = 0; i < count; i++ )
 		{
-			var transform = transforms[i];
+			var transform = transforms[start + i];
 			var scale = transform.Scale;
 			var center = transform.PointToWorld( modelCenter );
 			var radius = _modelRadius * MathF.Max( scale.x, MathF.Max( scale.y, scale.z ) );
@@ -111,28 +163,26 @@ internal class ClutterBatchSceneObject : SceneCustomObject
 			worldBounds = worldBounds.AddBBox( modelBounds.Transform( transform ) );
 		}
 
-		_instances.SetData( instances );
-		_spheres.SetData( spheres );
+		_instances.SetData<GpuInstanceTransform>( instances, start );
+		_spheres.SetData<Vector4>( spheres, start );
 
-		Bounds = worldBounds;
-
-		BuildCommandList();
+		Bounds = replaceBounds ? worldBounds : Bounds.AddBBox( worldBounds );
 	}
 
-	private void EnsureCapacity( int count )
+	private bool EnsureCapacity( int count, bool exact )
 	{
-		if ( _instances != null && count <= _capacity )
-			return;
+		if ( _instances != null && count <= _capacity && (!exact || count == _capacity) )
+			return false;
 
 		DisposeBuffers();
-		_capacity = count;
+		_capacity = exact ? count : Math.Max( 64, (int)BitOperations.RoundUpToPowerOf2( (uint)count ) );
 
-		_instances = new GpuBuffer<GpuInstanceTransform>( count, GpuBuffer.UsageFlags.Structured );
-		_spheres = new GpuBuffer<Vector4>( count, GpuBuffer.UsageFlags.Structured );
+		_instances = new GpuBuffer<GpuInstanceTransform>( _capacity, GpuBuffer.UsageFlags.Structured );
+		_spheres = new GpuBuffer<Vector4>( _capacity, GpuBuffer.UsageFlags.Structured );
 
 		for ( int lod = 0; lod < _lodCount; lod++ )
 		{
-			_visible[lod] = new GpuBuffer<GpuInstanceTransform>( count, GpuBuffer.UsageFlags.Structured | GpuBuffer.UsageFlags.Append );
+			_visible[lod] = new GpuBuffer<GpuInstanceTransform>( _capacity, GpuBuffer.UsageFlags.Structured | GpuBuffer.UsageFlags.Append );
 
 			var drawCallCount = _drawCallCounts[lod];
 			var args = new GpuBuffer.IndirectDrawIndexedArguments[drawCallCount];
@@ -150,6 +200,8 @@ internal class ClutterBatchSceneObject : SceneCustomObject
 			_args[lod] = new GpuBuffer<GpuBuffer.IndirectDrawIndexedArguments>( drawCallCount, GpuBuffer.UsageFlags.IndirectDrawArguments );
 			_args[lod].SetData( args );
 		}
+
+		return true;
 	}
 
 	/// <summary>

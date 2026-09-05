@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json.Serialization;
 
 namespace Sandbox.Clutter;
@@ -209,6 +210,7 @@ public class TerrainMaterialMapping
 [Expose]
 public class TerrainMaterialScatterer : Scatterer
 {
+	private const int StreamingTraceChunkSize = 32;
 	/// <summary>
 	/// Scale range for spawned objects.
 	/// </summary>
@@ -322,11 +324,27 @@ public class TerrainMaterialScatterer : Scatterer
 		return instances;
 	}
 
+	/// <summary>
+	/// Creates main-thread resumable work for an infinite terrain tile. The local RNG, jittered
+	/// point order, trace order, material selection and transform RNG consumption are identical to
+	/// <see cref="Generate"/>; only the trace/result loop is split into bounded chunks.
+	/// VERIFIED via /check-engine: no scene or GPU API leaves the main thread.
+	/// </summary>
+	internal TerrainMaterialScatterWork CreateStreamingWork( BBox bounds, ClutterDefinition clutter, int seed, Scene scene )
+	{
+		return new TerrainMaterialScatterWork( this, bounds, clutter, seed, scene ?? Game.ActiveScene );
+	}
+
 	private ClutterInstance CreateInstance( SceneTraceResult trace, ClutterEntry entry )
 	{
-		var scale = Random.Float( Scale.Min, Scale.Max );
+		return CreateInstance( trace, entry, Random );
+	}
+
+	private ClutterInstance CreateInstance( SceneTraceResult trace, ClutterEntry entry, Random random )
+	{
+		var scale = random.Float( Scale.Min, Scale.Max );
 		var normal = trace.Normal;
-		var yaw = RandomYaw ? Random.Float( 0f, 360f ) : 0f;
+		var yaw = RandomYaw ? random.Float( 0f, 360f ) : 0f;
 
 		Rotation rotation;
 		if ( AlignToNormal )
@@ -352,25 +370,35 @@ public class TerrainMaterialScatterer : Scatterer
 	/// </summary>
 	private Terrain GetTerrainFromTrace( SceneTraceResult trace )
 	{
+		return GetTerrainFromTrace( trace, ref _cachedTerrainObject, ref _cachedTerrain );
+	}
+
+	private static Terrain GetTerrainFromTrace( SceneTraceResult trace, ref GameObject cachedTerrainObject, ref Terrain cachedTerrain )
+	{
 		var hitObject = trace.GameObject;
 		if ( hitObject == null )
 			return null;
 
 		// Use cached terrain if hitting same object
-		if ( _cachedTerrainObject == hitObject )
-			return _cachedTerrain;
+		if ( cachedTerrainObject == hitObject )
+			return cachedTerrain;
 
 		// Cache the terrain lookup
-		_cachedTerrainObject = hitObject;
-		_cachedTerrain = hitObject.Components.Get<Terrain>();
+		cachedTerrainObject = hitObject;
+		cachedTerrain = hitObject.Components.Get<Terrain>();
 
-		return _cachedTerrain;
+		return cachedTerrain;
 	}
 
 	/// <summary>
 	/// Finds an entry that matches the terrain material at the given position.
 	/// </summary>
 	private ClutterEntry GetEntryForMaterial( ClutterDefinition clutter, Terrain.TerrainMaterialInfo materialInfo )
+	{
+		return GetEntryForMaterial( clutter, materialInfo, Random );
+	}
+
+	private ClutterEntry GetEntryForMaterial( ClutterDefinition clutter, Terrain.TerrainMaterialInfo materialInfo, Random random )
 	{
 		if ( Mappings is null or { Count: 0 } )
 			return null;
@@ -409,7 +437,7 @@ public class TerrainMaterialScatterer : Scatterer
 			return null;
 
 		// Pick a weighted random entry
-		var randomValue = Random.Float( 0f, totalWeight );
+		var randomValue = random.Float( 0f, totalWeight );
 		var currentWeight = 0f;
 
 		foreach ( var index in mapping.EntryIndices )
@@ -439,5 +467,134 @@ public class TerrainMaterialScatterer : Scatterer
 		}
 
 		return null;
+	}
+
+	private static ClutterEntry GetRandomEntry( ClutterDefinition clutter, Random random )
+	{
+		if ( clutter.IsEmpty )
+			return null;
+
+		var totalWeight = 0f;
+		foreach ( var entry in clutter.Entries )
+			if ( entry?.HasAsset is true && entry.Weight > 0 ) totalWeight += entry.Weight;
+
+		if ( totalWeight is 0 )
+			return null;
+
+		var randomValue = random.Float( 0f, totalWeight );
+		var currentWeight = 0f;
+		foreach ( var entry in clutter.Entries )
+		{
+			if ( entry?.HasAsset is not true || entry.Weight <= 0 ) continue;
+			currentWeight += entry.Weight;
+			if ( randomValue <= currentWeight ) return entry;
+		}
+
+		return null;
+	}
+
+	internal sealed class TerrainMaterialScatterWork
+	{
+		private readonly TerrainMaterialScatterer _scatterer;
+		private readonly ClutterDefinition _clutter;
+		private readonly Scene _scene;
+		private readonly Random _random;
+		private readonly Vector3[] _points;
+		private readonly BBox _sceneBounds;
+		private readonly List<ClutterInstance> _instances;
+
+		private GameObject _cachedTerrainObject;
+		private Terrain _cachedTerrain;
+		private int _nextPoint;
+
+		internal TerrainMaterialScatterWork( TerrainMaterialScatterer scatterer, BBox bounds, ClutterDefinition clutter, int seed, Scene scene )
+		{
+			_scatterer = scatterer;
+			_clutter = clutter;
+			_scene = scene;
+			_random = new Random( seed );
+
+			if ( scene == null || clutter == null || clutter.IsEmpty )
+			{
+				_points = [];
+				_instances = [];
+				return;
+			}
+
+			var pointCount = CalculatePointCountExact( bounds, scatterer.Density, _random );
+			_points = CreateJitteredGridExact( bounds, pointCount, _random );
+			_instances = new List<ClutterInstance>( _points.Length );
+			_sceneBounds = scene.GetBounds();
+		}
+
+		internal List<ClutterInstance> Instances => _instances;
+		internal int PointsProcessed => _nextPoint;
+
+		internal bool ExecuteUntil( long deadlineTimestamp )
+		{
+			while ( _nextPoint < _points.Length )
+			{
+				var count = Math.Min( StreamingTraceChunkSize, _points.Length - _nextPoint );
+				var chunk = new ArraySegment<Vector3>( _points, _nextPoint, count );
+				using var pooledTraces = RentGroundTraces( _scene, chunk, _sceneBounds );
+
+				foreach ( var trace in pooledTraces.Span )
+					ProcessTrace( trace );
+
+				_nextPoint += count;
+				if ( _nextPoint < _points.Length && Stopwatch.GetTimestamp() >= deadlineTimestamp )
+					return false;
+			}
+
+			return true;
+		}
+
+		private void ProcessTrace( SceneTraceResult trace )
+		{
+			if ( !trace.Hit ) return;
+
+			var terrain = GetTerrainFromTrace( trace, ref _cachedTerrainObject, ref _cachedTerrain );
+			if ( terrain == null )
+			{
+				if ( _scatterer.UseFallback )
+				{
+					var fallback = GetRandomEntry( _clutter, _random );
+					if ( fallback != null ) _instances.Add( _scatterer.CreateInstance( trace, fallback, _random ) );
+				}
+				return;
+			}
+
+			var materialInfo = terrain.GetMaterialAtWorldPosition( trace.HitPosition );
+			if ( !materialInfo.HasValue || materialInfo.Value.IsHole ) return;
+
+			var entry = _scatterer.GetEntryForMaterial( _clutter, materialInfo.Value, _random );
+			if ( entry == null && _scatterer.UseFallback ) entry = GetRandomEntry( _clutter, _random );
+			if ( entry != null ) _instances.Add( _scatterer.CreateInstance( trace, entry, _random ) );
+		}
+
+		private static int CalculatePointCountExact( BBox bounds, float density, Random random )
+		{
+			var desired = bounds.Size.x.InchToMeter() * bounds.Size.y.InchToMeter() * density / 10f;
+			var guaranteed = (int)desired;
+			var count = guaranteed + (random.Float( 0f, 1f ) < desired - guaranteed ? 1 : 0);
+			return Math.Clamp( count, 0, 10000 );
+		}
+
+		private static Vector3[] CreateJitteredGridExact( BBox bounds, int pointCount, Random random )
+		{
+			GetJitteredGridSize( bounds, pointCount, out int cellsX, out int cellsY );
+			if ( cellsX <= 0 || cellsY <= 0 ) return [];
+
+			var cellWidth = bounds.Size.x / cellsX;
+			var cellHeight = bounds.Size.y / cellsY;
+			var points = new Vector3[cellsX * cellsY];
+			var index = 0;
+			for ( int cy = 0; cy < cellsY; cy++ )
+				for ( int cx = 0; cx < cellsX; cx++ )
+					points[index++] = new Vector3(
+						bounds.Mins.x + cx * cellWidth + random.Float( cellWidth ),
+						bounds.Mins.y + cy * cellHeight + random.Float( cellHeight ), 0f );
+			return points;
+		}
 	}
 }

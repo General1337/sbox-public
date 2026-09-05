@@ -24,6 +24,23 @@ class ClutterLayer
 	private readonly record struct ClutterBatchKey( Model Model, bool CastShadows );
 
 	private readonly Dictionary<ClutterBatchKey, ClutterBatchSceneObject> _batches = [];
+	private sealed class IncrementalBatchState
+	{
+		public List<Transform> Slots { get; } = [];
+		public int ActiveCount;
+		public int Tombstones;
+	}
+
+	private readonly record struct TileBatchRange( ClutterBatchKey Key, int Start, int Count );
+	private readonly Dictionary<ClutterBatchKey, IncrementalBatchState> _incrementalStates = [];
+	private readonly Dictionary<Vector2Int, List<TileBatchRange>> _tileBatchRanges = [];
+	private readonly HashSet<Vector2Int> _pendingIncrementalTiles = [];
+	private readonly Dictionary<ClutterBatchKey, List<Transform>> _tileAppendScratch = [];
+	private readonly List<ClutterBatchKey> _incrementalKeyScratch = [];
+	private bool _incrementalInitialized;
+	private bool _forceFullIncrementalRebuild;
+	private int _idleCompactionFrames;
+	private const int DeferredCompactionFrames = 120;
 
 	private readonly Dictionary<ClutterBatchKey, List<Transform>> _instancesByModel = [];
 	private readonly HashSet<ClutterBatchKey> _activeModels = [];
@@ -66,6 +83,7 @@ class ClutterLayer
 
 		Settings = newSettings;
 		_lastSettingsHash = newHash;
+		_forceFullIncrementalRebuild = true;
 	}
 
 	public List<ClutterGenerationJob> UpdateTiles( Vector3 center )
@@ -136,6 +154,8 @@ class ClutterLayer
 
 	public void OnTilePopulated( ClutterTile tile )
 	{
+		if ( UsesIncrementalStreaming )
+			_pendingIncrementalTiles.Add( tile.Coordinates );
 		_dirty = true;
 	}
 
@@ -153,6 +173,8 @@ class ClutterLayer
 	/// </summary>
 	public void ClearTileModelInstances( Vector2Int tileCoord )
 	{
+		if ( UsesIncrementalStreaming )
+			RemoveIncrementalTile( tileCoord );
 		ModelInstancesByTile.Remove( tileCoord );
 		RemoveBodies( tileCoord );
 	}
@@ -247,6 +269,18 @@ class ClutterLayer
 
 	public void RebuildBatches()
 	{
+		if ( UsesIncrementalStreaming )
+		{
+			RebuildBatchesIncremental();
+			return;
+		}
+
+		ResetIncrementalTracking();
+		RebuildBatchesLegacy();
+	}
+
+	private void RebuildBatchesLegacy()
+	{
 		// Don't build batch list on headless. We only care about collisions.
 		if ( Application.IsHeadless ) { _dirty = false; return; }
 
@@ -302,6 +336,318 @@ class ClutterLayer
 		_dirty = false;
 	}
 
+	private bool UsesIncrementalStreaming
+	{
+		get
+		{
+			if ( !ClutterGridSystem.IncrementalStreaming ) return false;
+			var component = ParentObject?.Components.Get<ClutterComponent>();
+			return component.IsValid() && component.Infinite;
+		}
+	}
+
+	private void RebuildBatchesIncremental()
+	{
+		if ( Application.IsHeadless ) { _dirty = false; return; }
+		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
+		if ( scene?.SceneWorld == null ) { _dirty = false; return; }
+
+		if ( !_incrementalInitialized || _forceFullIncrementalRebuild )
+		{
+			RebuildIncrementalFromSource( scene, _forceFullIncrementalRebuild );
+			return;
+		}
+
+		foreach ( var tileCoord in _pendingIncrementalTiles )
+		{
+			if ( _tileBatchRanges.ContainsKey( tileCoord ) || !ModelInstancesByTile.TryGetValue( tileCoord, out var instances ) )
+			{
+				_forceFullIncrementalRebuild = true;
+				break;
+			}
+
+			BuildTileScratch( instances );
+			var ranges = new List<TileBatchRange>( _tileAppendScratch.Count );
+			foreach ( var (key, transforms) in _tileAppendScratch )
+			{
+				if ( transforms.Count == 0 ) continue;
+				var state = GetOrCreateIncrementalState( scene, key );
+				var start = state.Slots.Count;
+				state.Slots.AddRange( transforms );
+				state.ActiveCount += transforms.Count;
+				var uploaded = _batches[key].UpdateInstancesIncremental( state.Slots, start );
+				if ( uploaded < transforms.Count )
+				{
+					_forceFullIncrementalRebuild = true;
+					break;
+				}
+
+				ranges.Add( new TileBatchRange( key, start, transforms.Count ) );
+				ClutterGridSystem.s_uploadedRecords += uploaded;
+				ClutterGridSystem.s_appendedRecords += transforms.Count;
+			}
+
+			if ( _forceFullIncrementalRebuild ) break;
+			_tileBatchRanges[tileCoord] = ranges;
+		}
+
+		_pendingIncrementalTiles.Clear();
+		if ( _forceFullIncrementalRebuild )
+		{
+			RebuildIncrementalFromSource( scene, fallback: true );
+			return;
+		}
+
+		_dirty = false;
+		_idleCompactionFrames = 0;
+	}
+
+	private void RebuildIncrementalFromSource( Scene scene, bool fallback )
+	{
+		_incrementalStates.Clear();
+		_tileBatchRanges.Clear();
+		_pendingIncrementalTiles.Clear();
+		_activeModels.Clear();
+
+		foreach ( var (tileCoord, instances) in ModelInstancesByTile )
+		{
+			BuildTileScratch( instances );
+			var ranges = new List<TileBatchRange>( _tileAppendScratch.Count );
+			foreach ( var (key, transforms) in _tileAppendScratch )
+			{
+				if ( transforms.Count == 0 ) continue;
+				var state = GetOrCreateIncrementalState( scene, key );
+				var start = state.Slots.Count;
+				state.Slots.AddRange( transforms );
+				state.ActiveCount += transforms.Count;
+				ranges.Add( new TileBatchRange( key, start, transforms.Count ) );
+				_activeModels.Add( key );
+			}
+			_tileBatchRanges[tileCoord] = ranges;
+		}
+
+		foreach ( var (key, state) in _incrementalStates )
+		{
+			var uploaded = _batches[key].UpdateInstancesIncremental( state.Slots, 0 );
+			if ( uploaded < 0 )
+			{
+				Log.Warning( $"Clutter incremental full rebuild failed for {key.Model?.ResourcePath}; selecting legacy rebuild." );
+				ResetIncrementalTracking();
+				RebuildBatchesLegacy();
+				ClutterGridSystem.s_incrementalFallbacks++;
+				return;
+			}
+			ClutterGridSystem.s_uploadedRecords += uploaded;
+		}
+
+		_staleModels.Clear();
+		foreach ( var key in _batches.Keys )
+			if ( !_activeModels.Contains( key ) ) _staleModels.Add( key );
+		foreach ( var key in _staleModels )
+		{
+			_batches[key].Delete();
+			_batches.Remove( key );
+		}
+
+		_incrementalInitialized = true;
+		_forceFullIncrementalRebuild = false;
+		_dirty = false;
+		_idleCompactionFrames = 0;
+		if ( fallback ) ClutterGridSystem.s_incrementalFallbacks++;
+		ClutterGridSystem.s_fullBatchRebuilds++;
+	}
+
+	private IncrementalBatchState GetOrCreateIncrementalState( Scene scene, ClutterBatchKey key )
+	{
+		if ( !_incrementalStates.TryGetValue( key, out var state ) )
+		{
+			state = new IncrementalBatchState();
+			_incrementalStates[key] = state;
+		}
+		if ( !_batches.ContainsKey( key ) )
+			_batches[key] = new ClutterBatchSceneObject( scene.SceneWorld, key.Model, key.CastShadows );
+		return state;
+	}
+
+	private void BuildTileScratch( List<ClutterInstance> instances )
+	{
+		foreach ( var list in _tileAppendScratch.Values ) list.Clear();
+		foreach ( var instance in instances )
+		{
+			if ( instance.Entry?.Model == null ) continue;
+			var key = new ClutterBatchKey( instance.Entry.Model, instance.Entry.CastShadows );
+			if ( !_tileAppendScratch.TryGetValue( key, out var list ) )
+			{
+				list = [];
+				_tileAppendScratch[key] = list;
+			}
+			list.Add( instance.Transform );
+		}
+	}
+
+	private void RemoveIncrementalTile( Vector2Int tileCoord )
+	{
+		if ( _pendingIncrementalTiles.Remove( tileCoord ) ) return;
+		if ( !_incrementalInitialized || !_tileBatchRanges.Remove( tileCoord, out var ranges ) ) return;
+
+		foreach ( var range in ranges )
+		{
+			if ( !_incrementalStates.TryGetValue( range.Key, out var state ) ||
+				range.Start < 0 || range.Count <= 0 || range.Start + range.Count > state.Slots.Count ||
+				state.ActiveCount < range.Count || !_batches.TryGetValue( range.Key, out var batch ) ||
+				!batch.MarkInactive( range.Start, range.Count ) )
+			{
+				_forceFullIncrementalRebuild = true;
+				continue;
+			}
+
+			state.ActiveCount -= range.Count;
+			state.Tombstones += range.Count;
+			ClutterGridSystem.s_inactiveRecords += range.Count;
+			ClutterGridSystem.s_uploadedRecords += range.Count;
+		}
+		_dirty = true;
+		_idleCompactionFrames = 0;
+	}
+
+	internal void CompactDeferredIfIdle()
+	{
+		if ( !UsesIncrementalStreaming || !_incrementalInitialized ) return;
+		var tombstones = 0;
+		foreach ( var state in _incrementalStates.Values ) tombstones += state.Tombstones;
+		if ( tombstones == 0 ) { _idleCompactionFrames = 0; return; }
+		if ( ++_idleCompactionFrames < DeferredCompactionFrames ) return;
+
+		var scene = ParentObject?.Scene ?? GridSystem?.Scene;
+		if ( scene?.SceneWorld == null ) return;
+		RebuildIncrementalFromSource( scene, fallback: false );
+		ClutterGridSystem.s_deferredCompactions++;
+	}
+
+	internal bool ValidateIncremental( out string detail )
+	{
+		if ( !UsesIncrementalStreaming || !_incrementalInitialized || _forceFullIncrementalRebuild )
+		{
+			detail = "candidate state unavailable or fallback latched";
+			return false;
+		}
+
+		var expectedCounts = new Dictionary<ClutterBatchKey, int>();
+		var lastEnds = new Dictionary<ClutterBatchKey, int>();
+		var hash = new HashCode();
+
+		foreach ( var (tileCoord, instances) in ModelInstancesByTile )
+		{
+			if ( !_tileBatchRanges.TryGetValue( tileCoord, out var ranges ) )
+			{
+				detail = $"missing ranges for tile {tileCoord}";
+				return false;
+			}
+
+			BuildTileScratch( instances );
+			var expectedRangeCount = 0;
+			foreach ( var (key, transforms) in _tileAppendScratch )
+			{
+				if ( transforms.Count == 0 ) continue;
+				expectedRangeCount++;
+				var found = false;
+				TileBatchRange range = default;
+				foreach ( var candidate in ranges )
+				{
+					if ( candidate.Key != key ) continue;
+					if ( found ) { detail = $"duplicate range for {tileCoord}"; return false; }
+					found = true;
+					range = candidate;
+				}
+
+				if ( !found || range.Count != transforms.Count ||
+					!_incrementalStates.TryGetValue( key, out var state ) ||
+					range.Start < 0 || range.Start + range.Count > state.Slots.Count )
+				{
+					detail = $"invalid range/count for tile {tileCoord}";
+					return false;
+				}
+
+				if ( lastEnds.TryGetValue( key, out var lastEnd ) && range.Start < lastEnd )
+				{
+					detail = $"overlap/order failure for tile {tileCoord}";
+					return false;
+				}
+
+				for ( int i = 0; i < transforms.Count; i++ )
+				{
+					var expected = transforms[i];
+					var actual = state.Slots[range.Start + i];
+					if ( !actual.Equals( expected ) )
+					{
+						detail = $"transform mismatch for tile {tileCoord} index {i}";
+						return false;
+					}
+					hash.Add( expected );
+				}
+
+				lastEnds[key] = range.Start + range.Count;
+				expectedCounts[key] = expectedCounts.GetValueOrDefault( key ) + range.Count;
+			}
+
+			if ( ranges.Count != expectedRangeCount )
+			{
+				detail = $"extra range for tile {tileCoord}";
+				return false;
+			}
+		}
+
+		foreach ( var (key, state) in _incrementalStates )
+		{
+			var expected = expectedCounts.GetValueOrDefault( key );
+			if ( expected != state.ActiveCount || state.Slots.Count - state.Tombstones != state.ActiveCount )
+			{
+				detail = $"active/tombstone count mismatch for {key.Model?.ResourcePath}";
+				return false;
+			}
+		}
+
+		detail = $"tiles={ModelInstancesByTile.Count} keys={_incrementalStates.Count} active={expectedCounts.Values.Sum()} hash={hash.ToHashCode():x8}";
+		return true;
+	}
+
+	internal (int Count, int Hash) GetOrderedSourceSignature()
+	{
+		var count = 0;
+		var hash = new HashCode();
+		foreach ( var (tileCoord, instances) in ModelInstancesByTile )
+		{
+			hash.Add( tileCoord );
+			foreach ( var instance in instances )
+			{
+				if ( instance.Entry?.Model == null ) continue;
+				hash.Add( instance.Entry.Model.ResourcePath );
+				hash.Add( instance.Entry.CastShadows );
+				hash.Add( instance.Transform );
+				count++;
+			}
+		}
+		return (count, hash.ToHashCode());
+	}
+
+	internal void ForceIncrementalFallbackForTest()
+	{
+		if ( !UsesIncrementalStreaming ) return;
+		_forceFullIncrementalRebuild = true;
+		_dirty = true;
+		RebuildBatches();
+	}
+
+	private void ResetIncrementalTracking()
+	{
+		_incrementalStates.Clear();
+		_tileBatchRanges.Clear();
+		_pendingIncrementalTiles.Clear();
+		_incrementalInitialized = false;
+		_forceFullIncrementalRebuild = false;
+		_idleCompactionFrames = 0;
+	}
+
 	public void ClearAllTiles()
 	{
 		foreach ( var tile in Tiles.Values )
@@ -326,6 +672,7 @@ class ClutterLayer
 
 		_batches.Clear();
 		_instancesByModel.Clear();
+		ResetIncrementalTracking();
 		_dirty = false;
 	}
 

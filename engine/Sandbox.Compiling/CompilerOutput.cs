@@ -53,4 +53,10 @@ public class CompilerOutput
 	/// For referencing this assembly from another compiler.
 	/// </summary>
 	internal PortableExecutableReference MetadataReference { get; set; }
+	internal CompileReference CompileReference { get; set; }
+
+	internal string AssemblyCacheKey { get; set; }
+	internal bool LoadedFromAssemblyCache { get; set; }
+	internal bool AssemblyCachePublicationAllowed { get; set; }
+	internal IReadOnlyDictionary<string, string> PackageAssetDependencies { get; set; } = new Dictionary<string, string>();
 }

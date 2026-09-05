@@ -119,11 +119,11 @@ public partial class CompilerTest
 			_assemblyBytes = assemblyBytes;
 		}
 
-		public PortableExecutableReference Lookup( string reference )
+		public CompileReference Lookup( string reference )
 		{
 			if ( string.Equals( reference, _referenceName, System.StringComparison.OrdinalIgnoreCase ) )
 			{
-				return MetadataReference.CreateFromImage( _assemblyBytes );
+				return CompileReference.FromBytes( _assemblyBytes );
 			}
 
 			return null;

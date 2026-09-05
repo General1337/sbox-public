@@ -337,7 +337,7 @@ internal static partial class PackageManager
 			NativeEngine.g_pResourceSystem.ReloadSymlinkedResidentResources();
 		}
 
-		public Microsoft.CodeAnalysis.PortableExecutableReference Lookup( string reference )
+		public CompileReference Lookup( string reference )
 		{
 			// we can't do anything unless it's in a package
 			if ( !reference.StartsWith( "package." ) )
@@ -360,7 +360,7 @@ internal static partial class PackageManager
 				if ( found == null ) continue;
 
 				var bytes = package.AssemblyFileSystem.ReadAllBytes( found ).ToArray();
-				return Microsoft.CodeAnalysis.MetadataReference.CreateFromImage( bytes );
+				return CompileReference.FromBytes( bytes );
 			}
 
 			return default;

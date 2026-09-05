@@ -14,8 +14,9 @@ internal static class ResourceLoader
 
 	/// Registers resource paths into PathIndex without loading them, for any file whose
 	/// extension is in <paramref name="extensions"/>. Called during LoadAllGameResource.
-	private static void RegisterPaths( ReadOnlySpan<string> files, IReadOnlySet<string> extensions )
+	private static int RegisterPaths( ReadOnlySpan<string> files, HashSet<string> extensions )
 	{
+		var registered = 0;
 		foreach ( var file in files )
 		{
 			if ( !extensions.Contains( System.IO.Path.GetExtension( file ) ) )
@@ -23,46 +24,88 @@ internal static class ResourceLoader
 
 			// RegisterPath calls FixPath internally, which strips the _c suffix.
 			Game.Resources.RegisterPath( file );
+			registered++;
 		}
+
+		return registered;
+	}
+
+	private static void IncrementCount( Dictionary<string, int> counts, string extension )
+	{
+		counts.TryGetValue( extension, out var count );
+		counts[extension] = count + 1;
 	}
 
 	internal static void LoadAllGameResource( BaseFileSystem fileSystem, bool reloadExisting = false, Package sourcePackage = null )
 	{
+		using var totalTrace = CompileTrace.Begin( "resource.total", group: sourcePackage?.FullIdent, restartPath: "sync" );
 		var sw = Stopwatch.StartNew();
 		var types = Game.TypeLibrary.GetAttributes<AssetTypeAttribute>().DistinctBy( x => x.Extension )
 			.ToDictionary( x => $".{x.Extension}_c", x => x, StringComparer.OrdinalIgnoreCase );
-
-		var allFiles = fileSystem.FindFile( "/", "*", true ).ToArray();
 
 		// Union GameResource extensions with native-only ones so PathIndex covers everything.
 		var allExtensions = new HashSet<string>( types.Keys, StringComparer.OrdinalIgnoreCase );
 		allExtensions.UnionWith( NativeExtensions );
 
-		RegisterPaths( allFiles, allExtensions );
+		string[] allFiles;
+		var enumeratedCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		var registeredPaths = 0;
+		using ( var stage = CompileTrace.Begin( "resource.enumerate", group: sourcePackage?.FullIdent, restartPath: "sync" ) )
+		{
+			allFiles = fileSystem.FindFile( "/", "*", true ).ToArray();
+			registeredPaths = RegisterPaths( allFiles, allExtensions );
+			foreach ( var file in allFiles )
+			{
+				var extension = System.IO.Path.GetExtension( file );
+				if ( types.ContainsKey( extension ) ) IncrementCount( enumeratedCounts, extension );
+			}
+			stage.Complete( "success", $"mode=sync;files={allFiles.Length};registered={registeredPaths};extensions={CompileTrace.FormatCounts( enumeratedCounts )}" );
+		}
 
 		var allResources = new List<GameResource>();
+		var resourceExtensions = new List<string>();
+		var loadedCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		var candidates = 0;
+		var skippedExisting = 0;
+		var failed = 0;
 
-		foreach ( var file in allFiles )
+		using ( var stage = CompileTrace.Begin( "resource.load", group: sourcePackage?.FullIdent, restartPath: "sync" ) )
 		{
-			var extension = System.IO.Path.GetExtension( file );
-
-			if ( !types.TryGetValue( extension, out var type ) )
-				continue;
-
-			// Skip resources that are already fully loaded - this allows calling this method
-			// multiple times (e.g. once per package) without redundant work.
-			if ( !reloadExisting && ResourceLibrary.TryGet<GameResource>( file.Trim( '/' ), out var existing ) && !existing.IsPromise )
-				continue;
-
-			try
+			foreach ( var file in allFiles )
 			{
-				var se = Game.Resources.LoadGameResource( type, file, fileSystem, true, sourcePackage );
-				if ( se != null ) allResources.Add( se );
+				var extension = System.IO.Path.GetExtension( file );
+
+				if ( !types.TryGetValue( extension, out var type ) )
+					continue;
+				candidates++;
+
+				// Skip resources that are already fully loaded - this allows calling this method
+				// multiple times (e.g. once per package) without redundant work.
+				if ( !reloadExisting && ResourceLibrary.TryGet<GameResource>( file.Trim( '/' ), out var existing ) && !existing.IsPromise )
+				{
+					skippedExisting++;
+					continue;
+				}
+
+				try
+				{
+					var se = Game.Resources.LoadGameResource( type, file, fileSystem, true, sourcePackage );
+					if ( se != null )
+					{
+						allResources.Add( se );
+						resourceExtensions.Add( extension );
+						IncrementCount( loadedCounts, extension );
+					}
+				}
+				catch ( Exception ex )
+				{
+					failed++;
+					Log.Warning( ex, $"Exception when trying to load {file}" );
+				}
 			}
-			catch ( Exception ex )
-			{
-				Log.Warning( ex, $"Exception when trying to load {file}" );
-			}
+
+			stage.Complete( failed == 0 ? "success" : "partial",
+				$"mode=sync;candidates={candidates};loaded={allResources.Count};skippedExisting={skippedExisting};failed={failed};extensions={CompileTrace.FormatCounts( loadedCounts )}" );
 		}
 
 		//
@@ -70,9 +113,15 @@ internal static class ResourceLoader
 		// Everyone is gonna wanna do Resource.Get<>() within their PostLoad and not care about load order.
 		// This keeps things intuitive for end users.
 		//
-		foreach ( var resource in allResources )
+		var postLoadCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		using ( var stage = CompileTrace.Begin( "resource.postload", group: sourcePackage?.FullIdent, restartPath: "sync" ) )
 		{
-			resource.PostLoadInternal();
+			for ( var i = 0; i < allResources.Count; i++ )
+			{
+				allResources[i].PostLoadInternal();
+				IncrementCount( postLoadCounts, resourceExtensions[i] );
+			}
+			stage.Complete( "success", $"mode=sync;postLoaded={allResources.Count};extensions={CompileTrace.FormatCounts( postLoadCounts )}" );
 		}
 
 		foreach ( var type in types )
@@ -80,12 +129,16 @@ internal static class ResourceLoader
 			AddWatcherForType( type.Value );
 		}
 
+		totalTrace.Complete( failed == 0 ? "success" : "partial",
+			$"mode=sync;files={allFiles.Length};registered={registeredPaths};loaded={allResources.Count};postLoaded={allResources.Count};failed={failed}" );
+
 		// TODO: Check for edited but not saved OR recompiled assets and load in their values on server/client
 		// like editing an asset while the gamemode is running would?
 	}
 
 	internal static async Task LoadAllGameResourceAsync( BaseFileSystem fileSystem, CancellationToken ct = default, bool reloadExisting = false, Package sourcePackage = null )
 	{
+		using var totalTrace = CompileTrace.Begin( "resource.total", group: sourcePackage?.FullIdent, restartPath: "async" );
 		var sw = Stopwatch.StartNew();
 		var types = Game.TypeLibrary.GetAttributes<AssetTypeAttribute>().DistinctBy( x => x.Extension )
 			.ToDictionary( x => $".{x.Extension}_c", x => x, StringComparer.OrdinalIgnoreCase );
@@ -94,52 +147,93 @@ internal static class ResourceLoader
 		allExtensions.UnionWith( NativeExtensions );
 
 		var allFiles = new List<string>();
-		foreach ( var file in fileSystem.FindFile( "/", "*", true ) )
+		var enumeratedCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		var registeredPaths = 0;
+		using ( var stage = CompileTrace.Begin( "resource.enumerate", group: sourcePackage?.FullIdent, restartPath: "async" ) )
 		{
-			ct.ThrowIfCancellationRequested();
-			allFiles.Add( file );
-			if ( allExtensions.Contains( System.IO.Path.GetExtension( file ) ) )
-				Game.Resources.RegisterPath( file );
-			if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( file ); await Task.Yield(); sw.Restart(); }
+			foreach ( var file in fileSystem.FindFile( "/", "*", true ) )
+			{
+				ct.ThrowIfCancellationRequested();
+				allFiles.Add( file );
+				var extension = System.IO.Path.GetExtension( file );
+				if ( allExtensions.Contains( extension ) )
+				{
+					Game.Resources.RegisterPath( file );
+					registeredPaths++;
+				}
+				if ( types.ContainsKey( extension ) ) IncrementCount( enumeratedCounts, extension );
+				if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( file ); await Task.Yield(); sw.Restart(); }
+			}
+			stage.Complete( "success", $"mode=async;files={allFiles.Count};registered={registeredPaths};extensions={CompileTrace.FormatCounts( enumeratedCounts )}" );
 		}
 
 		var allResources = new List<GameResource>();
+		var resourceExtensions = new List<string>();
+		var loadedCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		var candidates = 0;
+		var skippedExisting = 0;
+		var failed = 0;
 
-		foreach ( var file in allFiles )
+		using ( var stage = CompileTrace.Begin( "resource.load", group: sourcePackage?.FullIdent, restartPath: "async" ) )
 		{
-			ct.ThrowIfCancellationRequested();
-			var extension = System.IO.Path.GetExtension( file );
-			if ( !types.TryGetValue( extension, out var type ) ) continue;
-
-			// Skip resources that are already fully loaded - this allows calling this method
-			// multiple times (e.g. once per package) without redundant work.
-			if ( !reloadExisting && ResourceLibrary.TryGet<GameResource>( file.Trim( '/' ), out var existing ) && !existing.IsPromise )
-				continue;
-
-			try
+			foreach ( var file in allFiles )
 			{
-				var se = Game.Resources.LoadGameResource( type, file, fileSystem, true, sourcePackage );
-				if ( se != null ) allResources.Add( se );
-			}
-			catch ( Exception ex )
-			{
-				Log.Warning( ex, $"Exception when trying to load {file}" );
-			}
+				ct.ThrowIfCancellationRequested();
+				var extension = System.IO.Path.GetExtension( file );
+				if ( !types.TryGetValue( extension, out var type ) ) continue;
+				candidates++;
 
-			if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( file ); await Task.Yield(); sw.Restart(); }
+				// Skip resources that are already fully loaded - this allows calling this method
+				// multiple times (e.g. once per package) without redundant work.
+				if ( !reloadExisting && ResourceLibrary.TryGet<GameResource>( file.Trim( '/' ), out var existing ) && !existing.IsPromise )
+				{
+					skippedExisting++;
+					continue;
+				}
+
+				try
+				{
+					var se = Game.Resources.LoadGameResource( type, file, fileSystem, true, sourcePackage );
+					if ( se != null )
+					{
+						allResources.Add( se );
+						resourceExtensions.Add( extension );
+						IncrementCount( loadedCounts, extension );
+					}
+				}
+				catch ( Exception ex )
+				{
+					failed++;
+					Log.Warning( ex, $"Exception when trying to load {file}" );
+				}
+
+				if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( file ); await Task.Yield(); sw.Restart(); }
+			}
+			stage.Complete( failed == 0 ? "success" : "partial",
+				$"mode=async;candidates={candidates};loaded={allResources.Count};skippedExisting={skippedExisting};failed={failed};extensions={CompileTrace.FormatCounts( loadedCounts )}" );
 		}
 
-		foreach ( var resource in allResources )
+		var postLoadCounts = new Dictionary<string, int>( StringComparer.OrdinalIgnoreCase );
+		using ( var stage = CompileTrace.Begin( "resource.postload", group: sourcePackage?.FullIdent, restartPath: "async" ) )
 		{
-			ct.ThrowIfCancellationRequested();
-			resource.PostLoadInternal();
-			if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( resource.ResourcePath ); await Task.Yield(); sw.Restart(); }
+			for ( var i = 0; i < allResources.Count; i++ )
+			{
+				ct.ThrowIfCancellationRequested();
+				var resource = allResources[i];
+				resource.PostLoadInternal();
+				IncrementCount( postLoadCounts, resourceExtensions[i] );
+				if ( sw.ElapsedMilliseconds > 8 ) { LoadingScreen.Subtitle = System.IO.Path.GetFileName( resource.ResourcePath ); await Task.Yield(); sw.Restart(); }
+			}
+			stage.Complete( "success", $"mode=async;postLoaded={allResources.Count};extensions={CompileTrace.FormatCounts( postLoadCounts )}" );
 		}
 
 		LoadingScreen.Subtitle = null;
 
 		foreach ( var type in types )
 			AddWatcherForType( type.Value );
+
+		totalTrace.Complete( failed == 0 ? "success" : "partial",
+			$"mode=async;files={allFiles.Count};registered={registeredPaths};loaded={allResources.Count};postLoaded={allResources.Count};failed={failed}" );
 	}
 
 

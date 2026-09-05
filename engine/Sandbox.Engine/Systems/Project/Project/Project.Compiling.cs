@@ -106,6 +106,7 @@ public partial class Project
 			Log.Trace( $"Create Compiler `{compilerName}`" );
 
 			Compiler = CompileGroup.CreateCompiler( compilerName, codePath, compilerSettings );
+			ConfigureLocalAssemblyCache( Compiler );
 
 			if ( BaseReferencingTypes.Contains( Config.Type ) && compilerName != "base" )
 			{
@@ -334,6 +335,7 @@ public partial class Project
 		Log.Trace( $"Create Editor Compiler `{compilerName}`" );
 
 		EditorCompiler = CompileGroup.CreateCompiler( compilerName, GetEditorPath(), compilerSettings );
+		ConfigureLocalAssemblyCache( EditorCompiler );
 
 		if ( Compiler is not null )
 		{
@@ -429,6 +431,7 @@ public partial class Project
 				project.AssemblyFileSystem.CreateDirectory( "/.bin" );
 				project.AssemblyFileSystem.WriteAllBytes( $"/.bin/{assembly.Compiler.AssemblyName}.dll", assembly.AssemblyData );
 				project.AssemblyFileSystem.WriteAllBytes( $"/.bin/{assembly.Compiler.AssemblyName}.cll", cll );
+				assembly.Compiler.PublishAssemblyCache( assembly );
 
 				if ( project.CacheAssemblies )
 				{
@@ -447,6 +450,16 @@ public partial class Project
 				}
 			}
 		}
+	}
+
+	void ConfigureLocalAssemblyCache( Compiler compiler )
+	{
+		if ( compiler is null || IsBuiltIn || !Application.IsEditor ) return;
+		var value = Utility.CommandLine.GetSwitch( "-localassemblycache", "read" );
+		if ( !Enum.TryParse<CompilerAssemblyCacheMode>( value, true, out var mode ) ) mode = CompilerAssemblyCacheMode.Off;
+		if ( mode == CompilerAssemblyCacheMode.Off ) return;
+		var directory = Path.Combine( GetRootPath(), ".sbox", "cache", "assemblies-v1" );
+		compiler.AssemblyCacheSettings = new CompilerAssemblyCacheSettings( directory, mode );
 	}
 
 	/// <summary>

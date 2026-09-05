@@ -13,6 +13,23 @@ namespace Editor;
 /// </summary>
 static class StartupLoadProject
 {
+	internal enum StartupCompilePath
+	{
+		BackgroundBuildReady,
+		RecoveryBuildReady,
+		RecoveryCancelled,
+		Exception
+	}
+
+	internal static string GetTraceValue( StartupCompilePath path ) => path switch
+	{
+		StartupCompilePath.BackgroundBuildReady => "background-build-ready",
+		StartupCompilePath.RecoveryBuildReady => "recovery-build-ready",
+		StartupCompilePath.RecoveryCancelled => "recovery-cancelled",
+		StartupCompilePath.Exception => "exception",
+		_ => throw new ArgumentOutOfRangeException( nameof( path ) )
+	};
+
 	public static bool IsLoading { get; private set; } = false;
 
 	public static Logger Log = new( "Startup" );
@@ -186,16 +203,60 @@ static class StartupLoadProject
 		// Compiles and waits for the project in a bullshit way - this already starts happening way sooner
 		Step( "Compiling projects" );
 
-		if ( await EditorUtility.Projects.Updated( project ) == false )
+		var compileStarted = Stopwatch.GetTimestamp();
+		using ( var startupTimer = Bootstrap.StartupTiming?.ScopeTimer( $"Load Project: Compile" ) )
 		{
-			using var _ = Bootstrap.StartupTiming?.ScopeTimer( $"Load Project: Compile" );
-			// load failed, present the user with the information
-			// and let them decide if they want to continue broken or bail (or fix things, recompile and continue)
+			try
+			{
+				if ( await EditorUtility.Projects.Updated( project ) == false )
+				{
+					// load failed, present the user with the information
+					// and let them decide if they want to continue broken or bail (or fix things, recompile and continue)
 
-			if ( await StartupFailedPopup.Show( project ) == false )
-				return false;
+					if ( await StartupFailedPopup.Show( project ) == false )
+					{
+						CompileTrace.Emit(
+							"startup.project_compile",
+							Stopwatch.GetElapsedTime( compileStarted ).TotalMilliseconds,
+							"cancelled",
+							group: project.Config.FullIdent,
+							restartPath: GetTraceValue( StartupCompilePath.RecoveryCancelled ),
+							detail: "cache-read-disabled" );
+						return false;
+					}
 
-			await EditorUtility.Projects.WaitForCompiles();
+					await EditorUtility.Projects.WaitForCompiles();
+
+					CompileTrace.Emit(
+						"startup.project_compile",
+						Stopwatch.GetElapsedTime( compileStarted ).TotalMilliseconds,
+						"success",
+						group: project.Config.FullIdent,
+						restartPath: GetTraceValue( StartupCompilePath.RecoveryBuildReady ),
+						detail: "cache-read-disabled" );
+				}
+				else
+				{
+					CompileTrace.Emit(
+						"startup.project_compile",
+						Stopwatch.GetElapsedTime( compileStarted ).TotalMilliseconds,
+						"success",
+						group: project.Config.FullIdent,
+						restartPath: GetTraceValue( StartupCompilePath.BackgroundBuildReady ),
+						detail: "cache-read-disabled" );
+				}
+			}
+			catch ( Exception ex )
+			{
+				CompileTrace.Emit(
+					"startup.project_compile",
+					Stopwatch.GetElapsedTime( compileStarted ).TotalMilliseconds,
+					"exception",
+					group: project.Config.FullIdent,
+					restartPath: GetTraceValue( StartupCompilePath.Exception ),
+					detail: $"{ex.GetType().Name}: {ex.Message}" );
+				throw;
+			}
 		}
 
 		if ( project.Config.Type == "addon" && !string.IsNullOrWhiteSpace( parentPackage ) )

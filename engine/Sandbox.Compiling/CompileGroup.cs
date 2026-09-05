@@ -361,7 +361,7 @@ public class CompileGroup : IDisposable
 	/// Find a reference for this dll. Throws if a reference is not found / invalid, and returns <see langword="null"/> if
 	/// a reference should be silently ignored (like self-referencing).
 	/// </summary>
-	internal async Task<PortableExecutableReference> FindReferenceAsync( string reference, Compiler fromCompiler )
+	internal async Task<CompileReference> FindReferenceAsync( string reference, Compiler fromCompiler )
 	{
 		// To retain backwards compatibility
 		if ( reference == "package.local.base" )
@@ -392,7 +392,10 @@ public class CompileGroup : IDisposable
 			if ( output.MetadataReference is null )
 				throw new System.Exception( $"Broken Reference: {reference} (the metadata is null)" );
 
-			return output.MetadataReference;
+			if ( output.CompileReference is null )
+				throw new System.Exception( $"Broken Reference: {reference} (exact image digest is null)" );
+
+			return output.CompileReference;
 		}
 
 		//
@@ -466,5 +469,5 @@ public interface ICompileReferenceProvider
 	/// <summary>
 	/// Find a reference for this dll
 	/// </summary>
-	PortableExecutableReference Lookup( string reference );
+	CompileReference Lookup( string reference );
 }

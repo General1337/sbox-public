@@ -268,12 +268,22 @@ internal sealed partial class PackageLoader : IDisposable
 		bool isEditorAssembly = filename.EndsWith( ".editor.dll", StringComparison.OrdinalIgnoreCase ) && !ap.Package.IsRemote;
 		bool isToolAssembly = ap.Package.TypeName == "tool" || isEditorAssembly;
 		var assmName = System.IO.Path.GetFileNameWithoutExtension( filename );
+		using var totalTrace = CompileTrace.Begin( "loader.assembly_total", assmName, ap.Package.FullIdent );
 
 		// if this is an editor dll, it shouldn't have loaded anywhere but the tools!
 		Assert.False( isToolAssembly && !ToolsMode );
 		Assert.True( ap.AssemblyFileSystem.FileExists( filename ), "File doesn't exist? Maybe a case sensitivity issue??" );
 
-		bytes ??= ap.AssemblyFileSystem.ReadAllBytes( filename ).ToArray();
+		if ( bytes is null )
+		{
+			using var stage = CompileTrace.Begin( "loader.dll_read", assmName, ap.Package.FullIdent );
+			bytes = ap.AssemblyFileSystem.ReadAllBytes( filename ).ToArray();
+			stage.Complete( "success", $"bytes={bytes.Length}" );
+		}
+		else
+		{
+			CompileTrace.Emit( "loader.dll_read", 0, "provided", assmName, ap.Package.FullIdent, detail: $"bytes={bytes.Length}" );
+		}
 		var dll_stream = new System.IO.MemoryStream( bytes );
 
 		TrustedBinaryStream trustedDll = null;
@@ -296,7 +306,9 @@ internal sealed partial class PackageLoader : IDisposable
 		//
 		if ( !needsAccessControl )
 		{
+			using var stage = CompileTrace.Begin( "loader.access_verify", assmName, ap.Package.FullIdent );
 			trustedDll = PackageManager.AccessControl.TrustUnsafe( bytes );
+			stage.Complete( "trusted-local", $"bytes={bytes.Length}" );
 		}
 
 		//
@@ -304,12 +316,16 @@ internal sealed partial class PackageLoader : IDisposable
 		//
 		else
 		{
+			using var stage = CompileTrace.Begin( "loader.access_verify", assmName, ap.Package.FullIdent );
 			if ( !TestAccessControl( dll_stream, out trustedDll ) )
 			{
+				stage.Complete( "failed" );
+				totalTrace.Complete( "failed", "access-control" );
 				trustedDll?.Dispose();
 				log.Warning( $"Couldn't load {assmName} - access control error" );
 				return null;
 			}
+			stage.Complete( "success" );
 			trustedDll?.Dispose();
 		}
 
@@ -335,10 +351,28 @@ internal sealed partial class PackageLoader : IDisposable
 		byte[] codeArchive = null;
 		if ( ap.AssemblyFileSystem.FileExists( codearchivefilename ) )
 		{
+			using var stage = CompileTrace.Begin( "loader.cll_read", assmName, ap.Package.FullIdent );
 			codeArchive = ap.AssemblyFileSystem.ReadAllBytes( codearchivefilename ).ToArray();
+			stage.Complete( "success", $"bytes={codeArchive.Length}" );
+		}
+		else
+		{
+			CompileTrace.Emit( "loader.cll_read", 0, "missing", assmName, ap.Package.FullIdent );
 		}
 
-		var result = AddAssembly( ap.Package, assmName, trustedDll, codeArchive );
+		LoadedAssembly result;
+		using ( var stage = CompileTrace.Begin( "loader.add_assembly", assmName, ap.Package.FullIdent ) )
+		{
+			result = AddAssembly( ap.Package, assmName, trustedDll, codeArchive );
+			stage.Complete( result is null ? "failed" : "success",
+				result is null ? null : $"version={result.Version};fastHotload={result.FastHotload};fullHotload={result.FullHotload}" );
+		}
+
+		if ( result is null )
+		{
+			totalTrace.Complete( "failed", "add-assembly" );
+			return null;
+		}
 
 		if ( result.FastHotload && ap.Package is LocalPackage lp )
 		{
@@ -360,6 +394,8 @@ internal sealed partial class PackageLoader : IDisposable
 			}
 		}
 
+		totalTrace.Complete( "success",
+			$"version={result.Version};dllBytes={bytes.Length};cllBytes={codeArchive?.Length ?? 0};fastHotload={result.FastHotload};fullHotload={result.FullHotload}" );
 		return result;
 	}
 
@@ -494,20 +530,30 @@ internal sealed partial class PackageLoader : IDisposable
 		loaded.CodeArchiveBytes = codeArchive;
 
 		// read the compiled binary to a byte array
+		using ( var stage = CompileTrace.Begin( "loader.dll_materialize", assemblyName, package?.FullIdent ) )
 		{
 			using var ms = new MemoryStream();
 			dllStream.CopyTo( ms );
 			loaded.CompiledAssemblyBytes = ms.ToArray();
+			stage.Complete( "success", $"bytes={loaded.CompiledAssemblyBytes.Length}" );
 		}
 
 		if ( dllStream is not null )
 		{
+			using var stage = CompileTrace.Begin( "loader.load_context", assemblyName, package?.FullIdent );
 			loaded.Assembly = LoadContext.LoadWithEmbeds( loaded.CompiledAssemblyBytes, false );
 			loaded.Version = loaded.Assembly?.GetName().Version;
 			loaded.Name = loaded.Assembly?.GetName().Name;
+			stage.Complete( loaded.Assembly is null ? "failed" : "success", $"version={loaded.Version}" );
 		}
 
-		return AddAssembly( loaded );
+		using ( var stage = CompileTrace.Begin( "loader.register", assemblyName, package?.FullIdent ) )
+		{
+			var result = AddAssembly( loaded );
+			stage.Complete( result is null ? "failed" : "success",
+				result is null ? null : $"fastHotload={result.FastHotload};fullHotload={result.FullHotload}" );
+			return result;
+		}
 	}
 
 	internal LoadedAssembly AddAssembly( LoadedAssembly incoming )

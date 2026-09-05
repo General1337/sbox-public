@@ -11,7 +11,7 @@ namespace Sandbox;
 [SkipHotload]
 static class FrameworkReferences
 {
-	public static CaseInsensitiveDictionary<PortableExecutableReference> All { get; } = new();
+	public static CaseInsensitiveDictionary<CompileReference> All { get; } = new();
 
 	static FrameworkReferences()
 	{
@@ -26,8 +26,9 @@ static class FrameworkReferences
 		{
 			using ( var stream = assembly.GetManifestResourceStream( resourceName ) )
 			{
-				var meta = MetadataReference.CreateFromStream( stream, default, default, resourceName );
-				All[resourceName] = meta;
+				using var memory = new MemoryStream();
+				stream.CopyTo( memory );
+				All[resourceName] = CompileReference.FromBytes( memory.ToArray(), resourceName );
 			}
 		}
 	}
@@ -53,7 +54,7 @@ static class FrameworkReferences
 	/// <summary>
 	/// Find a framework reference by its assembly name
 	/// </summary>
-	public static PortableExecutableReference FindByName( string name )
+	public static CompileReference FindByName( string name )
 	{
 		if ( string.IsNullOrWhiteSpace( name ) )
 			throw new ArgumentException( $"cannot be null or empty", nameof( name ) );
@@ -83,7 +84,7 @@ static class FrameworkReferences
 		}
 
 
-		return MetadataReference.CreateFromFile( assembly.Location );
+		return CompileReference.FromFile( assembly.Location );
 	}
 
 	private static List<string> LoadEmbeddedReferenceAssemblies()

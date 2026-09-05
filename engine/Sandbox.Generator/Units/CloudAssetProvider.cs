@@ -44,7 +44,7 @@ internal static class CloudAssetProvider
 		}
 
 		var packageIdent = ex.Token.ValueText;
-		var path = worker.Processor.PackageAssetResolver( packageIdent );
+		var path = worker.Processor.ResolvePackageAsset( packageIdent );
 
 		if ( path == null )
 		{

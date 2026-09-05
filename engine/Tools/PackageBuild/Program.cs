@@ -196,7 +196,7 @@ static class Program
 class EngineReferenceProvider : ICompileReferenceProvider
 {
 	readonly Dictionary<string, string> _paths = new( StringComparer.OrdinalIgnoreCase );
-	readonly Dictionary<string, PortableExecutableReference> _cache = new( StringComparer.OrdinalIgnoreCase );
+	readonly Dictionary<string, CompileReference> _cache = new( StringComparer.OrdinalIgnoreCase );
 
 	public EngineReferenceProvider( IEnumerable<string> dirs )
 	{
@@ -211,7 +211,7 @@ class EngineReferenceProvider : ICompileReferenceProvider
 		}
 	}
 
-	public PortableExecutableReference Lookup( string reference )
+	public CompileReference Lookup( string reference )
 	{
 		if ( _cache.TryGetValue( reference, out var cached ) )
 			return cached;
@@ -219,7 +219,7 @@ class EngineReferenceProvider : ICompileReferenceProvider
 		if ( !_paths.TryGetValue( reference, out var path ) )
 			return null;
 
-		try { return _cache[reference] = MetadataReference.CreateFromFile( path ); }
+		try { return _cache[reference] = CompileReference.FromFile( path ); }
 		catch { return _cache[reference] = null; } // skip unreadable / native DLLs
 	}
 }

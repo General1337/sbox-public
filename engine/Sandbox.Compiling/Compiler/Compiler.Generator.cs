@@ -24,10 +24,12 @@ partial class Compiler
 		}
 
 		output.Diagnostics.AddRange( processor.Diagnostics );
+		output.PackageAssetDependencies = processor.PackageAssetDependencies.ToDictionary( x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase );
 
 		// Error within code generation itself
 		if ( processor.Exception != null )
 		{
+			output.AssemblyCachePublicationAllowed = false;
 			Log.Error( processor.Exception, "Error when generating code" );
 
 			Sentry.SentrySdk.CaptureException( processor.Exception, scope =>

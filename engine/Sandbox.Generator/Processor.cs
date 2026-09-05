@@ -59,6 +59,15 @@ public class Processor
 	/// </summary>
 	public Func<string, string> PackageAssetResolver { get; set; } = DefaultPackageAssetResolver;
 
+	public ConcurrentDictionary<string, string> PackageAssetDependencies { get; } = new( StringComparer.OrdinalIgnoreCase );
+
+	internal string ResolvePackageAsset( string packageIdent )
+	{
+		var path = PackageAssetResolver?.Invoke( packageIdent );
+		if ( path is not null ) PackageAssetDependencies[packageIdent] = path;
+		return path;
+	}
+
 	public void AddTrees( IEnumerable<SyntaxTree> trees )
 	{
 		if ( Context == null )

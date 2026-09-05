@@ -87,6 +87,8 @@ public sealed partial class Compiler : IDisposable
 	/// </summary>
 	private Compiler.Configuration _config = new();
 
+	internal CompilerAssemblyCacheSettings AssemblyCacheSettings { get; set; }
+
 	/// <summary>
 	/// Should only ever get called from CompileGroup.
 	/// </summary>
@@ -205,9 +207,9 @@ public sealed partial class Compiler : IDisposable
 		return null;
 	}
 
-	internal async Task<IReadOnlyList<PortableExecutableReference>> BuildReferencesAsync( CodeArchive archive )
+	internal async Task<IReadOnlyList<CompileReference>> BuildReferencesAsync( CodeArchive archive )
 	{
-		var output = new List<PortableExecutableReference>( FrameworkReferences.All.Values );
+		var output = new List<CompileReference>( FrameworkReferences.All.Values );
 		var foundHash = new HashSet<string>( StringComparer.OrdinalIgnoreCase );
 
 		foreach ( var name in archive.References )
@@ -240,6 +242,18 @@ public sealed partial class Compiler : IDisposable
 		}
 
 		return _compileTcs.Task;
+	}
+
+	internal void PublishAssemblyCache( CompilerOutput output )
+	{
+		try
+		{
+			CompilerAssemblyCache.Publish( this, output );
+		}
+		catch ( Exception ex )
+		{
+			log.Warning( ex, "Assembly cache publication failed" );
+		}
 	}
 
 	/// <summary>

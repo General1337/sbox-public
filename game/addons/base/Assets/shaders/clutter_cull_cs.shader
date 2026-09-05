@@ -125,6 +125,10 @@ CS
 			return;
 
 		float4 sphere = AllInstanceSpheres[id]; // xyz = world center, w = world radius
+		// Incremental streaming leaves removed slots in place until idle compaction. A negative
+		// radius is the explicit inactive sentinel; it must never enter frustum/LOD selection.
+		if ( sphere.w < 0.0 )
+			return;
 
 		if ( !SphereInFrustum( sphere.xyz, sphere.w ) )
 			return;

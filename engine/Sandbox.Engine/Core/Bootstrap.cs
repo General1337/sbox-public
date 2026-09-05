@@ -20,6 +20,8 @@ internal static class Bootstrap
 	private static readonly Logger log = Logging.GetLogger();
 
 	internal static Api.Events.EventRecord StartupTiming;
+	private static long _startupStarted;
+	private static DateTimeOffset _processStartedUtc;
 
 	/// <summary>
 	/// Called before anything else. This should set up any low level stuff that
@@ -27,6 +29,8 @@ internal static class Bootstrap
 	/// </summary>
 	internal static void PreInit( CMaterialSystem2AppSystemDict appDict )
 	{
+		_startupStarted = Stopwatch.GetTimestamp();
+		_processStartedUtc = Process.GetCurrentProcess().StartTime.ToUniversalTime();
 		Application.Initialize( appDict.IsDedicatedServer(), appDict.IsConsoleApp(), appDict.IsInToolsMode(), appDict.IsInTestMode(), EngineGlobal.IsRetail() );
 
 		try
@@ -309,6 +313,21 @@ internal static class Bootstrap
 	/// </summary>
 	internal static void LoadingFinished()
 	{
+		var managedElapsedMilliseconds = _startupStarted == 0
+			? 0
+			: Stopwatch.GetElapsedTime( _startupStarted ).TotalMilliseconds;
+		var processElapsedMilliseconds = _processStartedUtc == default
+			? managedElapsedMilliseconds
+			: (DateTimeOffset.UtcNow - _processStartedUtc).TotalMilliseconds;
+
+		CompileTrace.Emit(
+			"startup.total",
+			processElapsedMilliseconds,
+			"success",
+			group: Application.GameIdent,
+			restartPath: Application.IsEditor ? "editor-startup" : Application.IsHeadless ? "server-startup" : "game-startup",
+			detail: $"cache-read-disabled;managedMs={managedElapsedMilliseconds:0.###}" );
+
 		if ( StartupTiming != null )
 		{
 			StartupTiming.FinishTimer( "Time" );
