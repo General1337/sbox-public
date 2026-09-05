@@ -215,7 +215,6 @@ public sealed partial class Compiler : IDisposable
 		foreach ( var name in archive.References )
 		{
 			// We already got it from a package reference
-			// this is cool for when referencing something that includes package.base.dll
 			if ( foundHash.Contains( name ) )
 				continue;
 

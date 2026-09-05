@@ -363,10 +363,6 @@ public class CompileGroup : IDisposable
 	/// </summary>
 	internal async Task<CompileReference> FindReferenceAsync( string reference, Compiler fromCompiler )
 	{
-		// To retain backwards compatibility
-		if ( reference == "package.local.base" )
-			reference = "package.base";
-
 		var compiler = FindCompilerByAssemblyName( reference );
 		if ( compiler != null )
 		{

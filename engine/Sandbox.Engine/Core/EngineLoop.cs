@@ -186,8 +186,8 @@ internal static class EngineLoop
 	static FastTimer refreshRateTimer = FastTimer.StartNew();
 
 	/// <summary>
-	/// Desktop refresh rate (Hz) of the default monitor, cached and re-queried every couple of
-	/// seconds. Returns 0 if unknown (treat as "no clamp").
+	/// Desktop refresh rate (Hz) of the monitor the game window is on, cached and re-queried every
+	/// couple of seconds so moving the window is picked up. Returns 0 if unknown (treat as "no clamp").
 	/// </summary>
 	static double GetDisplayRefreshRate()
 	{
@@ -195,7 +195,7 @@ internal static class EngineLoop
 		{
 			int w = 0, h = 0;
 			uint hz = 0;
-			EngineGlobal.Plat_GetDesktopResolution( EngineGlobal.Plat_GetDefaultMonitorIndex(), ref w, ref h, ref hz );
+			EngineGlobal.Plat_GetDesktopResolution( EngineGlobal.Plat_GetEngineWindowMonitorIndex(), ref w, ref h, ref hz );
 			cachedRefreshRate = hz;
 			refreshRateTimer = FastTimer.StartNew();
 		}
@@ -471,7 +471,6 @@ internal static class EngineLoop
 	{
 		ThreadSafe.AssertIsMainThread();
 		VideoTextureLoader.TickVideoPlayers();
-		TooltipSystem.Frame();
 		PanelRealTime.Update();
 
 		using ( _simulateUiGame.Start() )
@@ -577,6 +576,9 @@ internal static class EngineLoop
 		PerformanceStats.PollGpuFrameTime( 3 );
 
 		using var _outputScope = _clientOutput.Start();
+
+		// UI windows own their own swap chains, they're not part of anyone's view
+		Sandbox.UI.PanelWindows.FrameAll();
 
 		// The editor renders it's own game scene
 		if ( Application.IsEditor )

@@ -142,14 +142,18 @@ internal static partial class InputRouter
 		else
 		{
 			NativeEngine.InputSystem.SetIMEAllowed( true );
-			var rect = KeyboardFocusPanel.Rect;
+			var rect = KeyboardFocusPanel is Panel panel ? panel.ImeCaretRect : KeyboardFocusPanel.Rect;
 			NativeEngine.InputSystem.SetIMETextLocation( (int)rect.Left, (int)rect.Top, (int)rect.Width, (int)rect.Height );
 		}
 
 		MouseCursorDelta = 0;
 		EscapeWasPressed = false;
 
-		TooltipSystem.SetHovered( activeMouse?.MouseFocusPanel ?? null );
+		// Only the UI that has the mouse gets to show a tooltip - the one underneath it loses its hover
+		foreach ( var context in Contexts )
+		{
+			context.TargetUISystem?.Tooltips.SetHovered( context == activeMouse ? activeMouse.MouseFocusPanel as Panel : null );
+		}
 	}
 
 	static void SetCursorPosition( Vector2 pos )
@@ -181,10 +185,23 @@ internal static partial class InputRouter
 		{ "nwse-resize", InputStandardCursor_t.SizeNWSE },
 		{ "sizewe", InputStandardCursor_t.SizeWE },
 		{ "ew-resize", InputStandardCursor_t.SizeWE },
+		{ "col-resize", InputStandardCursor_t.SizeWE },
 		{ "sizens", InputStandardCursor_t.SizeNS },
 		{ "ns-resize", InputStandardCursor_t.SizeNS },
+		{ "row-resize", InputStandardCursor_t.SizeNS },
 		{ "not-allowed", InputStandardCursor_t.No },
 	};
+
+	/// <summary>
+	/// The standard cursor for a css cursor name. Arrow when the name is unknown.
+	/// </summary>
+	internal static InputStandardCursor_t GetStandardCursor( string name )
+	{
+		if ( !string.IsNullOrWhiteSpace( name ) && CursorLookup.TryGetValue( name, out var found ) )
+			return found;
+
+		return InputStandardCursor_t.Arrow;
+	}
 
 	static readonly HashSet<string> UserCursors = new();
 
@@ -196,7 +213,9 @@ internal static partial class InputRouter
 		{ "nesw-resize", "sizenesw" },
 		{ "nwse-resize", "sizenwse" },
 		{ "ew-resize", "sizewe" },
+		{ "col-resize", "sizewe" },
 		{ "ns-resize", "sizens" },
+		{ "row-resize", "sizens" },
 	};
 
 	static void SetCursorType( string name )
